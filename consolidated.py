@@ -6,9 +6,14 @@ from urllib.parse import quote_plus
 import time  # For polling
 from datetime import datetime, timedelta
 import concurrent.futures
+from requests.exceptions import RequestException
 
 # Set the maximum number of concurrent workers for the ThreadPoolExecutor
-MAX_WORKERS = 3
+MAX_WORKERS = 2
+
+# Retry parameters
+MAX_RETRIES = 3
+RETRY_DELAY = 5  # seconds
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -29,6 +34,24 @@ TOKEN_REFRESH_INTERVAL = ACCESS_TOKEN_EXPIRATION - timedelta(minutes=5)  # Refre
 
 # Progress File for resuming from last run
 PROGRESS_FILE = "progress.json"
+
+
+# Function to handle retry logic
+def retry_operation(operation, *args, max_retries=MAX_RETRIES, retry_delay=RETRY_DELAY, **kwargs):
+    """
+    Generic retry wrapper for operations that may fail intermittently.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            return operation(*args, **kwargs)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Attempt {attempt} failed: {e}")
+            if attempt < max_retries:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"Operation failed after {max_retries} attempts.")
+                raise
 
 def load_progress():
     """Load processing progress from file."""
@@ -83,8 +106,8 @@ def ensure_custom_fields(paperless_url, paperless_token):
         {"name": "Shoeboxed Document ID", "data_type": "string", "extra_data": "null"},
         # Receipt fields
         {"name": "Invoice Number", "data_type": "string", "extra_data": "null"},
-        {"name": "Tax", "data_type": "monetary", "extra_data": '{"default_currency": "usd"}'},
-        {"name": "Total", "data_type": "monetary", "extra_data": '{"default_currency": "usd"}'},
+        {"name": "Tax", "data_type": "monetary", "extra_data": '{"default_currency": "USD"}'},
+        {"name": "Total", "data_type": "monetary", "extra_data": '{"default_currency": "USD"}'},
         {"name": "Currency", "data_type": "string", "extra_data": "null"},
         {"name": "Payment Type", "data_type": "select", "extra_data": '{"select_options": ["credit-card", "cash", "paypal", "other", "check"]}'},
         {"name": "Card Last Four Digits", "data_type": "string", "extra_data": "null"},
@@ -243,7 +266,7 @@ def upload_document_to_paperless(document, custom_field_ids, paperless_url, pape
     """
     # Extract the necessary data
     file_url = document.get('attachment', {}).get('url')
-    file_name = document.get('attachment', {}).get('name')
+    file_name = document.get('id')
     document_type = document.get('type', 'other')  # Default to 'other' if type is not provided
 
     # Determine correspondent based on document type
@@ -334,7 +357,7 @@ def upload_document_to_paperless(document, custom_field_ids, paperless_url, pape
         logger.error(f"Failed to upload document {document.get('id')}. Status Code: {response.status_code}, Response: {response.text}")
         return None
 
-def poll_for_task_completion(task_id, paperless_url, paperless_token, timeout=600, interval=10):
+def poll_for_task_completion(task_id, paperless_url, paperless_token, timeout=600, interval=10, post_success_delay=2):
     """
     Polls the Paperless API for task completion and returns the document ID.
     Args:
@@ -343,6 +366,7 @@ def poll_for_task_completion(task_id, paperless_url, paperless_token, timeout=60
         paperless_token (str): Authorization token for the Paperless API.
         timeout (int, optional): The maximum time (in seconds) to wait for the task to complete. Defaults to 600.
         interval (int, optional): Time interval (in seconds) between polling attempts. Defaults to 10.
+        post_success_delay (int, optional): Time to wait (in seconds) after obtaining the document ID successfully. Defaults to 2.
     Returns:
         str: The document ID if the task completed successfully, None otherwise.
     """
@@ -361,6 +385,10 @@ def poll_for_task_completion(task_id, paperless_url, paperless_token, timeout=60
                 document_id = task_data[0]['related_document']
                 if document_id:
                     logging.info(f"Document ID obtained: {document_id}")
+                    
+                    # Adding a sleep to give the database some time to finalize the transaction
+                    time.sleep(post_success_delay)
+                    
                     return document_id
         elif response.status_code == 404:
             logging.warning(f"Task not found (404). Retrying after {interval} seconds...")
@@ -393,23 +421,29 @@ def update_document_custom_fields(document_id, custom_field_values, paperless_ur
         logging.info(f"No valid custom fields to update for document {document_id}.")
         return True
 
-    update_url = f"{paperless_url}/api/documents/{document_id}/"
-    headers = {
-        "Authorization": f"Token {paperless_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
+    def operation():
+        update_url = f"{paperless_url}/api/documents/{document_id}/"
+        headers = {
+            "Authorization": f"Token {paperless_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        payload = {
+            "custom_fields": [{"field": field_id, "value": value} for field_id, value in filtered_custom_field_values.items()]
+        }
 
-    payload = {
-        "custom_fields": [{"field": field_id, "value": value} for field_id, value in filtered_custom_field_values.items()]
-    }
+        response = requests.patch(update_url, headers=headers, json=payload)
+        if response.status_code in [200, 204]:
+            logging.info(f"Custom fields for document {document_id} updated successfully.")
+            return True
+        else:
+            raise requests.exceptions.RequestException(f"Failed to update custom fields for document {document_id}. Status Code: {response.status_code}, Response: {response.text}")
 
-    response = requests.patch(update_url, headers=headers, json=payload)
-    if response.status_code in [200, 204]:
-        logging.info(f"Custom fields for document {document_id} updated successfully.")
-        return True
-    else:
-        logging.error(f"Failed to update custom fields for document {document_id}. Status Code: {response.status_code}, Response: {response.text}")
+    # Wrap the operation in retry logic
+    try:
+        return retry_operation(operation)
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to update document custom fields for {document_id} after retries: {e}")
         return False
 
 def create_or_fetch_tag(paperless_url, paperless_token, tag_name):
@@ -462,9 +496,9 @@ def ensure_correspondents(paperless_url, paperless_token, document_correspondent
         headers={"Authorization": f"Token {paperless_token}"}
     )
     # Log the response details for better debugging
-    logger.info(f"Fetching correspondents from Paperless URL: {paperless_url}/api/correspondents/")
-    logger.info(f"Response Status Code: {response.status_code}")
-    logger.info(f"Response Text: {response.text}")
+    # logger.info(f"Fetching correspondents from Paperless URL: {paperless_url}/api/correspondents/")
+    # logger.info(f"Response Status Code: {response.status_code}")
+    # logger.info(f"Response Text: {response.text}")
     # Check the status code and return appropriately
     if response.status_code == 200:
         existing_correspondents = response.json().get('results', [])
@@ -998,6 +1032,75 @@ def process_document(document, paperless_url, paperless_token, client_id, client
     except Exception as e:
         logger.error(f"Error processing document {document['id']}: {e}")
         return False
+    
+def fetch_failed_tasks(paperless_url, paperless_token):
+    """
+    Fetches all tasks with a FAILURE status from the Paperless API.
+    Args:
+        paperless_url (str): The base URL for the Paperless API.
+        paperless_token (str): The authentication token for the API.
+    Returns:
+        list: A list of failed tasks, each containing task details.
+    """
+    task_url = f"{paperless_url}/api/tasks/"
+    headers = {
+        "Authorization": f"Token {paperless_token}",
+        "Accept": "application/json"
+    }
+
+    try:
+        response = retry_operation(requests.get, url=task_url, headers=headers)
+        if response.status_code == 200:
+            tasks = response.json()
+            failed_tasks = [task for task in tasks if task['status'] == 'FAILURE']
+            return failed_tasks
+        else:
+            logger.error(f"Failed to fetch tasks. Status Code: {response.status_code}, Response: {response.text}")
+            return []
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching tasks: {e}")
+        return []
+    
+def retry_failed_documents(failed_tasks, all_documents, paperless_url, paperless_token, client_id, client_secret, shoeboxed_refresh_token, custom_field_mapping, document_type_mapping):
+    """
+    Retries uploading documents that previously failed.
+    Args:
+        failed_tasks (list): List of tasks with FAILURE status.
+        all_documents (list): List of all documents that were originally processed.
+        paperless_url (str): Paperless API base URL.
+        paperless_token (str): Authorization token for the Paperless API.
+        client_id, client_secret, shoeboxed_refresh_token: Credentials needed for Shoeboxed operations.
+        custom_field_mapping, document_type_mapping: Mappings for Paperless fields.
+    """
+    for failed_task in failed_tasks:
+        failed_file_name = failed_task['task_file_name']
+        # Find the matching document by comparing the 'attachment.id' field
+        matching_document = next(
+            (document for document in all_documents if document.get('attachment', {}).get('id') == failed_file_name), None
+        )
+
+        if matching_document:
+            logger.info(f"Retrying document {matching_document['id']} with file name '{failed_file_name}' due to previous failure.")
+            try:
+                # Retry uploading the document using the same process_document function
+                result = process_document(
+                    matching_document,
+                    paperless_url,
+                    paperless_token,
+                    client_id,
+                    client_secret,
+                    shoeboxed_refresh_token,
+                    custom_field_mapping,
+                    document_type_mapping
+                )
+                if result:
+                    logger.info(f"Document {matching_document['id']} re-uploaded successfully.")
+                else:
+                    logger.error(f"Retry for document {matching_document['id']} failed.")
+            except Exception as e:
+                logger.error(f"Exception during retry for document {matching_document['id']}: {e}")
+        else:
+            logger.error(f"No matching document found for failed task file name '{failed_file_name}'. Skipping retry.")
 
 # ===========================
 # Main Function
@@ -1075,7 +1178,7 @@ if __name__ == "__main__":
     progress = load_progress()
     current_batch = progress.get('current_batch', 0)
 
-    # Step 7: Process Accounts and Documents with ThreadPoolExecutor
+    # Existing Step 7: Process Accounts and Documents with ThreadPoolExecutor
     if user_info is not None:
         logger.info(f"Account IDs: {user_info}")
         for account_id in user_info:
@@ -1083,6 +1186,11 @@ if __name__ == "__main__":
 
             # Fetch documents for the current account
             documents = fetch_and_process_documents(account_id, shoeboxed_access_token)
+            if not documents:
+                continue
+
+            # Keep track of documents
+            all_documents = documents
 
             # Create a ThreadPoolExecutor to process documents concurrently
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -1106,14 +1214,27 @@ if __name__ == "__main__":
                         result = future.result()
                         if result:
                             logger.info(f"Document {document['id']} processed successfully.")
-
-                            # Save progress after each successful document processing
                             current_batch += 1
                             progress['current_batch'] = current_batch
                             save_progress(progress)
-
                     except Exception as exc:
                         logger.error(f"Document {document['id']} generated an exception: {exc}")
+
+            # New Step: Check and retry failed tasks
+            failed_tasks = fetch_failed_tasks(paperless_url, paperless_token)
+            if failed_tasks:
+                logger.info(f"Retrying {len(failed_tasks)} failed document uploads...")
+                retry_failed_documents(
+                    failed_tasks,
+                    all_documents,
+                    paperless_url,
+                    paperless_token,
+                    client_id,
+                    client_secret,
+                    shoeboxed_refresh_token,
+                    custom_field_mapping,
+                    document_type_mapping
+                )
 
     else:
         logger.error("Failed to fetch user information.")
