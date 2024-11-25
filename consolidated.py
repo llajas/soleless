@@ -4,7 +4,7 @@ import json
 import logging
 from urllib.parse import quote_plus
 import time  # For polling
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -19,6 +19,24 @@ SHOEBOXED_CLIENT_ID = os.getenv('SHOEBOXED_CLIENT_ID')
 SHOEBOXED_CLIENT_SECRET = os.getenv('SHOEBOXED_CLIENT_SECRET')
 SHOEBOXED_REDIRECT_URI = os.getenv('SHOEBOXED_REDIRECT_URI')
 
+# Access Token and Refresh Token variables for Shoeboxed
+ACCESS_TOKEN_EXPIRATION = timedelta(minutes=30)  # Assuming 30 minutes validity
+TOKEN_REFRESH_INTERVAL = ACCESS_TOKEN_EXPIRATION - timedelta(minutes=5)  # Refresh 5 minutes before expiration
+
+# Progress File for resuming from last run
+PROGRESS_FILE = "progress.json"
+
+def load_progress():
+    """Load processing progress from file."""
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE, "r") as file:
+            return json.load(file)
+    return {}
+
+def save_progress(progress):
+    """Save current processing progress to a file."""
+    with open(PROGRESS_FILE, "w") as file:
+        json.dump(progress, file)
 
 # ===========================
 # Paperless Functions
@@ -210,8 +228,6 @@ def assign_document_type(paperless_url, headers, document_id, document_type_name
             logger.info(f"Document type '{document_type_name}' assigned to document {document_id}.")
     else:
         logger.error(f"Document type '{document_type_name}' not found in the mapping. Failed to assign to document {document_id}.")
-
-
 
 # ===========================
 # Upload Document Function
@@ -530,20 +546,38 @@ def generate_auth_url(client_id, redirect_uri):
     return auth_url
 
 def exchange_code_for_access_token(client_id, client_secret, authorization_code, redirect_uri):
+    """Exchange authorization code for access and refresh tokens"""
     token_url = "https://id.shoeboxed.com/oauth/token"
     payload = {
         'code': authorization_code,
         'grant_type': 'authorization_code',
         'redirect_uri': redirect_uri
     }
-    auth = (client_id, client_secret)
     headers = {
         'User-Agent': 'Mozilla/5.0',
-        'Accept': 'application/json'
+        'Accept': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded'
     }
-    response = requests.post(token_url, auth=auth, data=payload, headers=headers)
-    response.raise_for_status()
-    return response.json()
+
+    try:
+        response = requests.post(token_url, headers=headers, auth=(client_id, client_secret), data=payload)
+        response.raise_for_status()
+        token_data = response.json()
+        access_token = token_data.get('access_token')
+        refresh_token = token_data.get('refresh_token')
+
+        if not access_token or not refresh_token:
+            logger.error("Failed to obtain valid tokens from Shoeboxed response.")
+            return None, None
+
+        logger.info("Successfully obtained access and refresh tokens.")
+        return access_token, refresh_token
+
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"Error while exchanging code: {e}")
+        logger.error(f"Response status code: {response.status_code}")
+        logger.error(f"Response body: {response.text}")
+        return None, None
 
 def handle_token_response(token_response):
     access_token = token_response.get('access_token')
@@ -552,48 +586,76 @@ def handle_token_response(token_response):
     return access_token, refresh_token
 
 def refresh_access_token(client_id, client_secret, refresh_token):
+    """
+    Refreshes the access token using the provided refresh token.
+    Args:
+        client_id (str): The client ID of your application.
+        client_secret (str): The client secret of your application.
+        refresh_token (str): The refresh token to exchange for a new access token.
+    Returns:
+        Tuple: (new_access_token, new_refresh_token)
+    """
     token_url = "https://id.shoeboxed.com/oauth/token"
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded',  # Required for OAuth
+        'User-Agent': 'Mozilla/5.0',
+        'Accept': 'application/json'
+    }
     payload = {
         'grant_type': 'refresh_token',
         'refresh_token': refresh_token,
         'client_id': client_id,
         'client_secret': client_secret
     }
-    headers = {
-        'User-Agent': 'Mozilla/5.0',
-        'Accept': 'application/json'
-    }
-    response = requests.post(token_url, data=payload, headers=headers)
-    response.raise_for_status()
-    return handle_token_response(response.json())
+
+    try:
+        response = requests.post(token_url, data=payload, headers=headers)
+        response.raise_for_status()
+        response_data = response.json()
+        new_access_token = response_data.get('access_token')
+        new_refresh_token = response_data.get('refresh_token')
+
+        if not new_access_token or not new_refresh_token:
+            raise ValueError("Invalid response received from Shoeboxed API.")
+
+        logging.info(f"Access Token refreshed successfully.")
+        return new_access_token, new_refresh_token
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to refresh access token. RequestException: {e}")
+        raise
+    except ValueError as e:
+        logging.error(f"Failed to refresh access token. ValueError: {e}")
+        raise
 
 def authenticate_shoeboxed():
-    """
-    Complete Shoeboxed authentication workflow: generate auth URL, get authorization code, and obtain tokens.
-    """
+    """Authenticate with Shoeboxed and obtain tokens"""
     client_id = os.getenv('SHOEBOXED_CLIENT_ID')
     client_secret = os.getenv('SHOEBOXED_CLIENT_SECRET')
     redirect_uri = os.getenv('SHOEBOXED_REDIRECT_URI')
+    shoeboxed_auth_code = os.getenv('AUTHORIZATION_CODE')
 
     # Check for missing environment variables
     if not client_id or not client_secret or not redirect_uri:
         raise EnvironmentError("Missing Shoeboxed credentials in environment variables.")
 
-    # Generate authentication URL
-    auth_url = generate_auth_url(client_id, redirect_uri)
-    print("Please visit this URL to authorize:", auth_url)
+    # Check if AUTHORIZATION_CODE is provided in the environment
+    if shoeboxed_auth_code:
+        logger.info("Using authorization code from environment variable.")
+    else:
+        # Generate authentication URL and prompt for manual input
+        auth_url = generate_auth_url(client_id, redirect_uri)
+        print("Please visit this URL to authorize:", auth_url)
+        shoeboxed_auth_code = input("Please enter the Shoeboxed authorization code: ")
 
-    # Get authorization code from the user
-    authorization_code = input("Please enter the Shoeboxed authorization code: ")
+    # Exchange code for access and refresh tokens
+    access_token, refresh_token = exchange_code_for_access_token(client_id, client_secret, shoeboxed_auth_code, redirect_uri)
 
-    # Exchange code for access token
-    token_response = exchange_code_for_access_token(client_id, client_secret, authorization_code, redirect_uri)
-
-    # Handle and return tokens
-    if token_response:
-        return handle_token_response(token_response)
+    if access_token and refresh_token:
+        return access_token, refresh_token
     else:
         raise ValueError("Failed to obtain tokens from Shoeboxed.")
+
 
 def fetch_user_info(access_token):
     """
@@ -609,6 +671,25 @@ def fetch_user_info(access_token):
     user_info = response.json()
     account_ids = [account['id'] for account in user_info.get('accounts', [])]
     return account_ids
+
+def get_shoeboxed_tokens(client_id, client_secret, refresh_token):
+    """
+    Fetch or refresh Shoeboxed access tokens using the refresh token.
+    Args:
+        client_id (str): Client ID for Shoeboxed.
+        client_secret (str): Client Secret for Shoeboxed.
+        refresh_token (str): Refresh token to get new access token.
+    Returns:
+        tuple: access_token and new refresh_token
+    """
+    try:
+        # Refresh access token using the refresh token
+        new_tokens = refresh_access_token(client_id, client_secret, refresh_token)
+        logger.info("Access token successfully refreshed.")
+        return new_tokens
+    except Exception as e:
+        logger.error(f"Failed to refresh access token: {e}")
+        exit(1)  # Exit if unable to refresh, or consider handling retry logic
 
 def fetch_all_documents(account_id, access_token):
     """
@@ -850,7 +931,24 @@ if __name__ == "__main__":
         logger.error(e)
         exit(1)
 
-    # Step 3: Ensure Custom Fields Exist in Paperless and fetch them
+    # Step 3: Authenticate with Shoeboxed
+    try:
+        shoeboxed_access_token, shoeboxed_refresh_token = authenticate_shoeboxed()
+
+        if shoeboxed_access_token and shoeboxed_refresh_token:
+            logger.info("Shoeboxed authentication successful.")
+        else:
+            logger.error("Shoeboxed authentication failed. Exiting.")
+            exit(1)
+    except (EnvironmentError, ValueError) as e:
+        logger.error(e)
+        exit(1)
+
+    # Set up initial token refresh timing
+    start_time = datetime.now()
+    next_refresh_time = start_time + TOKEN_REFRESH_INTERVAL
+
+    # Step 4: Ensure Custom Fields Exist in Paperless and fetch them
     custom_fields_list = ensure_custom_fields(paperless_url, paperless_token)
     if not custom_fields_list:
         logger.error("Failed to retrieve custom fields from Paperless.")
@@ -860,7 +958,7 @@ if __name__ == "__main__":
     custom_field_mapping = create_custom_field_mapping(custom_fields_list)
     logger.info("Custom field mapping created.")
 
-    # Step 4: Ensure Document Types Exist in Paperless and fetch them
+    # Step 5: Ensure Document Types Exist in Paperless and fetch them
     document_types_list = ensure_document_types(paperless_url, {"Authorization": f"Token {paperless_token}"})
     if not document_types_list:
         logger.error("Failed to retrieve document types from Paperless.")
@@ -870,14 +968,6 @@ if __name__ == "__main__":
     document_type_mapping = {doc_type['name']: doc_type['id'] for doc_type in document_types_list}
     logger.info("Document type mapping created.")
 
-    # Step 5: Authenticate with Shoeboxed
-    try:
-        shoeboxed_access_token, shoeboxed_refresh_token = authenticate_shoeboxed()
-        logger.info("Shoeboxed authentication successful.")
-    except (EnvironmentError, ValueError) as e:
-        logger.error(e)
-        exit(1)
-
     # Step 6: Fetch and display user info from Shoeboxed
     try:
         user_info = fetch_user_info(shoeboxed_access_token)
@@ -885,17 +975,16 @@ if __name__ == "__main__":
         if e.response.status_code == 401:
             # Refresh access token if the access token is expired
             logger.info("Access token expired. Refreshing token...")
-            token_response = refresh_access_token(client_id, client_secret, shoeboxed_refresh_token)
-            if token_response:
-                shoeboxed_access_token, shoeboxed_refresh_token = token_response
-                # Retry fetching user info
-                user_info = fetch_user_info(shoeboxed_access_token)
-            else:
-                logger.error("Failed to refresh access token. Exiting.")
-                exit(1)
+            shoeboxed_access_token, shoeboxed_refresh_token = refresh_access_token(client_id, client_secret, shoeboxed_refresh_token)
+            # Retry fetching user info
+            user_info = fetch_user_info(shoeboxed_access_token)
         else:
             logger.error(f"Failed to fetch user information: {e}")
             exit(1)
+
+    # Load existing progress if available
+    progress = load_progress()
+    current_batch = progress.get('current_batch', 0)
 
     # Step 7: Process Accounts and Documents with Batching
     BATCH_SIZE = 10
@@ -912,6 +1001,13 @@ if __name__ == "__main__":
             # Process documents in batches
             for i in range(0, len(documents), BATCH_SIZE):
                 batch_documents = documents[i:i + BATCH_SIZE]
+
+                # Refresh token if needed before starting a new batch
+                current_time = datetime.now()
+                if current_time >= next_refresh_time:
+                    logger.info("Refreshing access token before continuing...")
+                    shoeboxed_access_token, shoeboxed_refresh_token = refresh_access_token(client_id, client_secret, shoeboxed_refresh_token)
+                    next_refresh_time = current_time + TOKEN_REFRESH_INTERVAL
 
                 # Process each document in the current batch
                 for document in batch_documents:
@@ -949,7 +1045,7 @@ if __name__ == "__main__":
                         }
                         document_type_name = document_type_name_map.get(shoeboxed_doc_type, "Documents")
 
-                        # Step 9: Handle tags for categories and envelope ID
+                        # Handle tags for categories and envelope ID
                         tags = []
                         if document_type == 'receipt' and document.get('categories'):
                             categories = document.get('categories', [])
@@ -964,7 +1060,7 @@ if __name__ == "__main__":
                         # Ensure tags are created or fetched from Paperless
                         tags = ensure_tags(paperless_url, {"Authorization": f"Token {paperless_token}"}, categories=document.get('categories', []), envelope_id=document.get('source', {}).get('envelope'))
 
-                        # Step 10: Upload document and associate custom fields
+                        # Upload document and associate custom fields
                         task_id = upload_document_to_paperless(
                             document,
                             custom_field_ids,
@@ -985,7 +1081,7 @@ if __name__ == "__main__":
                             logger.error(f"Failed to process document {document['id']}.")
                             continue
 
-                        # Step 11: Update document custom fields with values
+                        # Update document custom fields with values
                         if custom_field_values:
                             update_result = update_document_custom_fields(document_id, custom_field_values, paperless_url, paperless_token)
                             if update_result:
