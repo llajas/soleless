@@ -5,6 +5,10 @@ import logging
 from urllib.parse import quote_plus
 import time  # For polling
 from datetime import datetime, timedelta
+import concurrent.futures
+
+# Set the maximum number of concurrent workers for the ThreadPoolExecutor
+MAX_WORKERS = 3
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -909,6 +913,92 @@ def ensure_tags(paperless_url, headers, categories=None, envelope_id=None):
 
     return tag_ids
 
+def process_document(document, paperless_url, paperless_token, client_id, client_secret, shoeboxed_refresh_token, custom_field_mapping, document_type_mapping):
+    """Processes a single document."""
+    try:
+        # Extract correspondent based on document type
+        correspondent_name = None
+        document_type = document.get("type", "other")
+
+        if document_type == "receipt":
+            correspondent_name = document.get("vendor")
+        elif document_type == "business-card":
+            correspondent_name = document.get("company")
+        elif document_type == "other":
+            correspondent_name = document.get("name")
+
+        # Ensure Correspondents exist in Paperless
+        correspondent_mapping = ensure_correspondents(paperless_url, paperless_token, [correspondent_name] if correspondent_name else [])
+        if not correspondent_mapping:
+            logger.error(f"Failed to retrieve or create correspondents for document {document['id']}.")
+            return False
+
+        # Map custom fields to get values
+        custom_field_values = map_custom_fields(document, custom_field_mapping)
+        logger.info(f"Custom field mapping for document {document['id']} complete.")
+
+        # Get custom field IDs (without values) to associate during upload
+        custom_field_ids = list(custom_field_values.keys())
+
+        # Determine document type - direct mapping for consistency
+        shoeboxed_doc_type = document.get("type")
+        document_type_name_map = {
+            "business-card": "Business Cards",
+            "other": "Documents",
+            "receipt": "Receipts"
+        }
+        document_type_name = document_type_name_map.get(shoeboxed_doc_type, "Documents")
+
+        # Handle tags for categories and envelope ID
+        tags = []
+        if document_type == 'receipt' and document.get('categories'):
+            categories = document.get('categories', [])
+            tags += categories
+
+        # Check for envelope ID tag for documents sourced via mail
+        if document.get('source', {}).get('type') == 'mail':
+            envelope_id = document.get('source', {}).get('envelope')
+            if envelope_id:
+                tags.append(envelope_id)
+
+        # Ensure tags are created or fetched from Paperless
+        tags = ensure_tags(paperless_url, {"Authorization": f"Token {paperless_token}"}, categories=document.get('categories', []), envelope_id=document.get('source', {}).get('envelope'))
+
+        # Upload document and associate custom fields
+        task_id = upload_document_to_paperless(
+            document,
+            custom_field_ids,
+            paperless_url,
+            paperless_token,
+            correspondent_mapping,
+            document_type_name,
+            document_type_mapping,
+            tags
+        )
+        if not task_id:
+            logger.error(f"Failed to upload document {document['id']}.")
+            return False
+
+        # Poll for task completion to get document ID
+        document_id = poll_for_task_completion(task_id, paperless_url, paperless_token, timeout=600, interval=10)
+        if not document_id:
+            logger.error(f"Failed to process document {document['id']}.")
+            return False
+
+        # Update document custom fields with values
+        if custom_field_values:
+            update_result = update_document_custom_fields(document_id, custom_field_values, paperless_url, paperless_token)
+            if update_result:
+                logger.info(f"Document {document['id']} uploaded and metadata updated successfully.")
+            else:
+                logger.error(f"Failed to update custom fields for document {document['id']}.")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"Error processing document {document['id']}: {e}")
+        return False
+
 # ===========================
 # Main Function
 # ===========================
@@ -985,10 +1075,7 @@ if __name__ == "__main__":
     progress = load_progress()
     current_batch = progress.get('current_batch', 0)
 
-    # Step 7: Process Accounts and Documents with Batching
-    BATCH_SIZE = 10
-
-    # Step 8: Process Accounts and Documents
+    # Step 7: Process Accounts and Documents with ThreadPoolExecutor
     if user_info is not None:
         logger.info(f"Account IDs: {user_info}")
         for account_id in user_info:
@@ -997,102 +1084,37 @@ if __name__ == "__main__":
             # Fetch documents for the current account
             documents = fetch_and_process_documents(account_id, shoeboxed_access_token)
 
-            # Process documents in batches
-            for i in range(0, len(documents), BATCH_SIZE):
-                batch_documents = documents[i:i + BATCH_SIZE]
+            # Create a ThreadPoolExecutor to process documents concurrently
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                future_to_document = {
+                    executor.submit(
+                        process_document,
+                        document,
+                        paperless_url,
+                        paperless_token,
+                        client_id,
+                        client_secret,
+                        shoeboxed_refresh_token,
+                        custom_field_mapping,
+                        document_type_mapping
+                    ): document for document in documents
+                }
 
-                # Refresh token if needed before starting a new batch
-                current_time = datetime.now()
-                if current_time >= next_refresh_time:
-                    logger.info("Refreshing access token before continuing...")
-                    shoeboxed_access_token, shoeboxed_refresh_token = refresh_access_token(client_id, client_secret, shoeboxed_refresh_token)
-                    next_refresh_time = current_time + TOKEN_REFRESH_INTERVAL
-
-                # Process each document in the current batch
-                for document in batch_documents:
+                for future in concurrent.futures.as_completed(future_to_document):
+                    document = future_to_document[future]
                     try:
-                        # Extract correspondent based on document type
-                        correspondent_name = None
-                        document_type = document.get("type", "other")
+                        result = future.result()
+                        if result:
+                            logger.info(f"Document {document['id']} processed successfully.")
 
-                        if document_type == "receipt":
-                            correspondent_name = document.get("vendor")
-                        elif document_type == "business-card":
-                            correspondent_name = document.get("company")
-                        elif document_type == "other":
-                            correspondent_name = document.get("name")
+                            # Save progress after each successful document processing
+                            current_batch += 1
+                            progress['current_batch'] = current_batch
+                            save_progress(progress)
 
-                        # Ensure Correspondents exist in Paperless
-                        correspondent_mapping = ensure_correspondents(paperless_url, paperless_token, [correspondent_name] if correspondent_name else [])
-                        if not correspondent_mapping:
-                            logger.error(f"Failed to retrieve or create correspondents for document {document['id']}.")
-                            continue
+                    except Exception as exc:
+                        logger.error(f"Document {document['id']} generated an exception: {exc}")
 
-                        # Map custom fields to get values
-                        custom_field_values = map_custom_fields(document, custom_field_mapping)
-                        logger.info(f"Custom field mapping for document {document['id']} complete.")
-
-                        # Get custom field IDs (without values) to associate during upload
-                        custom_field_ids = list(custom_field_values.keys())
-
-                        # Determine document type - direct mapping for consistency
-                        shoeboxed_doc_type = document.get("type")
-                        document_type_name_map = {
-                            "business-card": "Business Cards",
-                            "other": "Documents",
-                            "receipt": "Receipts"
-                        }
-                        document_type_name = document_type_name_map.get(shoeboxed_doc_type, "Documents")
-
-                        # Handle tags for categories and envelope ID
-                        tags = []
-                        if document_type == 'receipt' and document.get('categories'):
-                            categories = document.get('categories', [])
-                            tags += categories
-
-                        # Check for envelope ID tag for documents sourced via mail
-                        if document.get('source', {}).get('type') == 'mail':
-                            envelope_id = document.get('source', {}).get('envelope')
-                            if envelope_id:
-                                tags.append(envelope_id)
-
-                        # Ensure tags are created or fetched from Paperless
-                        tags = ensure_tags(paperless_url, {"Authorization": f"Token {paperless_token}"}, categories=document.get('categories', []), envelope_id=document.get('source', {}).get('envelope'))
-
-                        # Upload document and associate custom fields
-                        task_id = upload_document_to_paperless(
-                            document,
-                            custom_field_ids,
-                            paperless_url,
-                            paperless_token,
-                            correspondent_mapping,
-                            document_type_name,
-                            document_type_mapping,
-                            tags
-                        )
-                        if not task_id:
-                            logger.error(f"Failed to upload document {document['id']}.")
-                            continue
-
-                        # Poll for task completion to get document ID
-                        document_id = poll_for_task_completion(task_id, paperless_url, paperless_token, timeout=600, interval=10)
-                        if not document_id:
-                            logger.error(f"Failed to process document {document['id']}.")
-                            continue
-
-                        # Update document custom fields with values
-                        if custom_field_values:
-                            update_result = update_document_custom_fields(document_id, custom_field_values, paperless_url, paperless_token)
-                            if update_result:
-                                logger.info(f"Document {document['id']} uploaded and metadata updated successfully.")
-                            else:
-                                logger.error(f"Failed to update custom fields for document {document['id']}.")
-
-                    except Exception as e:
-                        logger.error(f"Error processing document {document['id']}: {e}")
-
-                # Pause briefly after each batch to avoid overwhelming the system
-                time.sleep(5)
     else:
         logger.error("Failed to fetch user information.")
         exit(1)
