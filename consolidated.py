@@ -382,7 +382,7 @@ def update_document_custom_fields(document_id, custom_field_values, paperless_ur
     Returns:
         bool: True if the update was successful, False otherwise.
     """
-    # Filter out fields with `null` values
+    # Filter out fields with null values
     filtered_custom_field_values = {field_id: value for field_id, value in custom_field_values.items() if value is not None}
 
     if not filtered_custom_field_values:
@@ -655,7 +655,6 @@ def authenticate_shoeboxed():
         return access_token, refresh_token
     else:
         raise ValueError("Failed to obtain tokens from Shoeboxed.")
-
 
 def fetch_user_info(access_token):
     """
