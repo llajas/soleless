@@ -136,16 +136,26 @@ class ShoeboxedClient:
                 expires_in = response_data.get('expires_in', 1800)
                 self.token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
                 logger.info("Access token refreshed successfully.")
-            except Exception as e:
+            except requests.exceptions.HTTPError as e:
                 logger.error(f"Failed to refresh access token: {e}")
+                logger.error(f"Response status code: {response.status_code}")
+                logger.error(f"Response body: {response.text}")
                 raise
+            except Exception as e:
+                logger.error(f"Unexpected error during token refresh: {e}", exc_info=True)
+                raise
+
 
     def ensure_token_validity(self):
         """Ensure the access token is still valid, refresh if necessary"""
-        with self.token_lock:
-            if not self.access_token or datetime.now(timezone.utc) + TOKEN_REFRESH_MARGIN >= self.token_expiry:
-                logger.info("Access token is expired or about to expire. Refreshing...")
-                self.refresh_access_token()
+        try:
+            with self.token_lock:
+                if not self.access_token or datetime.now(timezone.utc) + TOKEN_REFRESH_MARGIN >= self.token_expiry:
+                    logger.info("Access token is expired or about to expire. Refreshing...")
+                    self.refresh_access_token()
+        except Exception as e:
+            logger.error(f"Error ensuring token validity: {e}", exc_info=True)
+            raise
 
     def get_headers(self):
         """Get the headers for API requests"""
@@ -686,14 +696,16 @@ class DocumentProcessor:
                 'task_id': task_id,
                 'document_id': document_id,
                 'custom_field_values': custom_field_values,
-                'attempt': attempt
+                'attempt': attempt,
+                'document_processor': self,
+                'document': document
             }
             self.task_queue.put(task_info)
             logger.info(f"Task {task_id} for document {document_id} added to the task queue.")
 
             return True
         except Exception as e:
-            logger.error(f"Error processing document {document_id}: {e}")
+            logger.error(f"Error processing document {document_id}: {e}", exc_info=True)
             return False
 
     def map_custom_fields(self, document):
@@ -852,57 +864,64 @@ class TaskMonitor(threading.Thread):
         self.pending_tasks = {}  # task_id: task_info
 
     def run(self):
-        while self.running or not self.task_queue.empty() or self.pending_tasks:
-            # Process tasks from the queue
-            while not self.task_queue.empty():
-                task_info = self.task_queue.get()
-                task_id = task_info['task_id']
-                self.pending_tasks[task_id] = {
-                    'task_info': task_info,
-                    'start_time': time.time()
-                }
-                logger.info(f"Monitoring started for task {task_id}")
+        try:
+            while self.running or not self.task_queue.empty() or self.pending_tasks:
+                # Process tasks from the queue
+                while not self.task_queue.empty():
+                    task_info = self.task_queue.get()
+                    task_id = task_info['task_id']
+                    self.pending_tasks[task_id] = {
+                        'task_info': task_info,
+                        'start_time': time.time()
+                    }
+                    logger.info(f"Monitoring started for task {task_id}")
 
-            # Check the status of pending tasks
-            completed_tasks = []
-            for task_id, task_data in self.pending_tasks.items():
-                task_info = task_data['task_info']
-                start_time = task_data['start_time']
+                # Check the status of pending tasks
+                completed_tasks = []
+                for task_id, task_data in list(self.pending_tasks.items()):
+                    task_info = task_data['task_info']
+                    start_time = task_data['start_time']
 
-                # Check for timeout
-                if time.time() - start_time > TASK_TIMEOUT:
-                    logger.error(f"Task {task_id} for document {task_info['document_id']} timed out.")
-                    completed_tasks.append(task_id)
-                    continue
+                    # Check for timeout
+                    if time.time() - start_time > TASK_TIMEOUT:
+                        logger.error(f"Task {task_id} for document {task_info['document_id']} timed out.")
+                        completed_tasks.append(task_id)
+                        continue
 
-                # Poll task status
-                status, document_id = self.paperless_client.check_task_status(task_id)
-                if status == 'SUCCESS':
-                    logger.info(f"Task {task_id} completed successfully for document {task_info['document_id']}.")
-                    # Update custom fields
-                    self.paperless_client.update_custom_fields(document_id, task_info['custom_field_values'])
-                    completed_tasks.append(task_id)
-                elif status == 'FAILURE':
-                    logger.error(f"Task {task_id} failed for document {task_info['document_id']}.")
-                    # Handle retries if applicable
-                    attempt = task_info['attempt']
-                    if attempt < MAX_RETRIES:
-                        logger.info(f"Retrying document {task_info['document_id']} (Attempt {attempt + 1})")
-                        # Re-upload the document and re-add to the queue
-                        document_processor = task_info.get('document_processor')
-                        if document_processor:
-                            document_processor.process_document(task_info['document'], attempt=attempt + 1)
+                    # Poll task status
+                    status, document_id = self.paperless_client.check_task_status(task_id)
+                    if status == 'SUCCESS':
+                        logger.info(f"Task {task_id} completed successfully for document {task_info['document_id']}.")
+                        # Update custom fields
+                        self.paperless_client.update_custom_fields(document_id, task_info['custom_field_values'])
+                        completed_tasks.append(task_id)
+                    elif status == 'FAILURE':
+                        logger.error(f"Task {task_id} failed for document {task_info['document_id']}.")
+                        # Handle retries if applicable
+                        attempt = task_info['attempt']
+                        if attempt < MAX_RETRIES:
+                            logger.info(f"Retrying document {task_info['document_id']} (Attempt {attempt + 1})")
+                            # Re-upload the document and re-add to the queue
+                            document_processor = task_info.get('document_processor')
+                            document = task_info.get('document')
+                            if document_processor and document:
+                                document_processor.process_document(document, attempt=attempt + 1)
+                            else:
+                                logger.error(f"Cannot retry document {task_info['document_id']} due to missing information.")
+                        else:
+                            logger.error(f"Maximum retry attempts reached for document {task_info['document_id']}.")
+                        completed_tasks.append(task_id)
                     else:
-                        logger.error(f"Maximum retry attempts reached for document {task_info['document_id']}.")
-                    completed_tasks.append(task_id)
-                else:
-                    logger.debug(f"Task {task_id} status: {status}")
+                        logger.debug(f"Task {task_id} status: {status}")
 
-            # Remove completed tasks
-            for task_id in completed_tasks:
-                del self.pending_tasks[task_id]
+                # Remove completed tasks
+                for task_id in completed_tasks:
+                    del self.pending_tasks[task_id]
 
-            time.sleep(TASK_POLL_INTERVAL)
+                time.sleep(TASK_POLL_INTERVAL)
+        except Exception as e:
+            logger.error(f"Exception in TaskMonitor: {e}", exc_info=True)
+            self.running = False
 
     def stop(self):
         self.running = False
