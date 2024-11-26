@@ -624,8 +624,23 @@ class PaperlessClient:
         task_url = f"{self.url}/api/tasks/?task_id={task_id}"
         response = requests.get(task_url, headers=self.headers)
         if response.status_code == 200:
-            data = response.json()
-            tasks = data.get('results', [])
+            try:
+                data = response.json()
+            except ValueError as e:
+                logger.error(f"Failed to parse JSON response for task {task_id}: {e}")
+                logger.error(f"Response content: {response.text}")
+                return None, None
+
+            # Check if data is a dict or list
+            if isinstance(data, dict):
+                tasks = data.get('results', [])
+            elif isinstance(data, list):
+                tasks = data
+            else:
+                logger.error(f"Unexpected data format received for task {task_id}: {type(data)}")
+                logger.error(f"Data content: {data}")
+                return None, None
+
             if tasks and len(tasks) > 0:
                 task = tasks[0]
                 status = task.get('status')
@@ -633,10 +648,12 @@ class PaperlessClient:
                 return status, document_id
             else:
                 logger.error(f"Task {task_id} not found in response.")
+                logger.error(f"Data content: {data}")
                 return None, None
         else:
             logger.error(f"Failed to get task status for {task_id}. Status Code: {response.status_code}, Response: {response.text}")
             return None, None
+
     
 # ===========================
 # Document Processor Class
