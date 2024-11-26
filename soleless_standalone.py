@@ -12,9 +12,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Constants
-MAX_WORKERS = 5
-MAX_RETRIES = 3
-RETRY_DELAY = 5  # seconds
+MAX_WORKERS = int(os.getenv('MAX_WORKERS', 5))
+MAX_RETRIES = int(os.getenv('MAX_RETRIES', 3))
+RETRY_DELAY = int(os.getenv('RETRY_DELAY', 5))  # seconds
 TOKEN_REFRESH_MARGIN = timedelta(minutes=5)  # Refresh 5 minutes before expiration
 
 # ===========================
