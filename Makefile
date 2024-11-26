@@ -1,6 +1,6 @@
 REGISTRY ?= "registry.lajas.tech"
 REPO ?= "soleless-app"
-TAG ?= $(shell get describe --tags --always --dirty)
+TAG ?= $(shell git describe --tags --always --dirty)
 IMG ?= $(REGISTRY)/$(REPO):$(TAG)
 
 .PHONY: build
