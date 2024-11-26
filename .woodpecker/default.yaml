@@ -1,0 +1,21 @@
+steps:
+  - name: docker-build
+    image: woodpeckerci/plugin-docker-buildx
+    settings:
+      registry: https://registry.lajas.tech/v2/
+      repo: registry.lajas.tech/soleless-app
+      dockerfile: Containerfile
+      tags:
+        - latest
+        - $CI_COMMIT_SHA
+        - $(git describe --tags --always --dirty)
+      username:
+        from_secret: registry_username
+      password:
+        from_secret: registry_token
+    when:
+      branch: main
+      event:
+        - push
+        - cron
+      cron: "Rebuild"
