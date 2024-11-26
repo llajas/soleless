@@ -529,7 +529,7 @@ class PaperlessClient:
             return task_id
         else:
             logger.error(f"Failed to upload document {document.get('id')}. Status Code: {response.status_code}, Response: {response.text}")
-            return None
+            return None, response.status_code
 
     def poll_task_completion(self, task_id, timeout=600, interval=10):
         """Poll for task completion and get document ID or handle failures immediately."""
@@ -699,7 +699,7 @@ class DocumentProcessor:
             tag_ids = [self.paperless_client.tag_mapping.get(tag) for tag in tags if tag in self.paperless_client.tag_mapping]
 
             # Upload document
-            task_id = self.paperless_client.upload_document(
+            task_id, status_code = self.paperless_client.upload_document(
                 document,
                 custom_field_ids,
                 correspondent_id,
@@ -709,12 +709,12 @@ class DocumentProcessor:
             if not task_id:
                 logger.error(f"Failed to upload document {document_id}.")
                 # Add retry logic here
-                if attempt < self.max_retries:
-                    logger.info(f"Retrying upload for document {document_id} (Attempt {attempt + 1})")
+                if status_code in [502, 503] and attempt < self.max_retries:
+                    logger.info(f"Retrying upload for document {document_id} due to server error (Attempt {attempt + 1})")
                     time.sleep(RETRY_DELAY)
                     return self.process_document(document, attempt=attempt + 1)
                 else:
-                    logger.error(f"Maximum retry attempts reached for document {document_id}.")
+                    logger.error(f"Maximum retry attempts reached for document {document_id} or unrecoverable error.")
                     return False
 
             # Add task to the queue for monitoring
