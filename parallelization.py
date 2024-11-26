@@ -3,11 +3,9 @@ import requests
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import concurrent.futures
-from requests.exceptions import RequestException
-from urllib.parse import quote_plus
-import shelve
+import threading
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -15,11 +13,9 @@ logger = logging.getLogger(__name__)
 
 # Constants
 MAX_WORKERS = 5
-MAX_RETRIES = 5
-MAX_RETRY_ATTEMPTS = 5
+MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
-TOKEN_REFRESH_INTERVAL = timedelta(minutes=25)  # Refresh 5 minutes before expiration
-PROGRESS_FILE = "progress.json"
+TOKEN_REFRESH_MARGIN = timedelta(minutes=5)  # Refresh 5 minutes before expiration
 
 # ===========================
 # Utility Functions
@@ -41,18 +37,6 @@ def retry_operation(operation, *args, max_retries=MAX_RETRIES, retry_delay=RETRY
                 logger.error(f"Operation failed after {max_retries} attempts.")
                 raise
 
-def load_progress():
-    """Load processing progress from file."""
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, "r") as file:
-            return json.load(file)
-    return {}
-
-def save_progress(progress):
-    """Save current processing progress to a file."""
-    with open(PROGRESS_FILE, "w") as file:
-        json.dump(progress, file)
-
 # ===========================
 # Shoeboxed Client Class
 # ===========================
@@ -63,6 +47,8 @@ class ShoeboxedClient:
         self.access_token = None
         self.refresh_token = None
         self.token_expiry = None  # datetime object
+        self.token_lock = threading.Lock()  # Lock for thread-safe token refresh
+        self.api_url = 'https://api.shoeboxed.com/v2'
 
     def check_env_vars(self):
         """Check if Shoeboxed environment variables are set"""
@@ -88,9 +74,8 @@ class ShoeboxedClient:
 
     def authenticate(self):
         """Authenticate with Shoeboxed and obtain tokens"""
-        self.access_token, self.refresh_token = self.exchange_code_for_access_token()
-        self.token_expiry = datetime.now() + timedelta(minutes=30)
-
+        self.access_token, self.refresh_token, expires_in = self.exchange_code_for_access_token()
+        self.token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
         if not self.access_token or not self.refresh_token:
             raise ValueError("Failed to obtain tokens from Shoeboxed.")
 
@@ -114,56 +99,64 @@ class ShoeboxedClient:
             token_data = response.json()
             access_token = token_data.get('access_token')
             refresh_token = token_data.get('refresh_token')
+            expires_in = token_data.get('expires_in', 1800)  # Default to 30 minutes
             logger.info("Successfully obtained access and refresh tokens.")
-            return access_token, refresh_token
+            return access_token, refresh_token, expires_in
         except requests.exceptions.HTTPError as e:
             logger.error(f"Error while exchanging code: {e}")
             logger.error(f"Response status code: {response.status_code}")
             logger.error(f"Response body: {response.text}")
-            return None, None
+            return None, None, None
 
     def refresh_access_token(self):
         """Refresh the access token using the refresh token"""
-        token_url = "https://id.shoeboxed.com/oauth/token"
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'User-Agent': 'Mozilla/5.0',
-            'Accept': 'application/json'
-        }
-        payload = {
-            'grant_type': 'refresh_token',
-            'refresh_token': self.refresh_token,
-            'client_id': self.client_id,
-            'client_secret': self.client_secret
-        }
+        with self.token_lock:
+            token_url = "https://id.shoeboxed.com/oauth/token"
+            headers = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': 'Mozilla/5.0',
+                'Accept': 'application/json'
+            }
+            payload = {
+                'grant_type': 'refresh_token',
+                'refresh_token': self.refresh_token,
+                'client_id': self.client_id,
+                'client_secret': self.client_secret
+            }
 
-        try:
-            response = requests.post(token_url, data=payload, headers=headers)
-            response.raise_for_status()
-            response_data = response.json()
-            self.access_token = response_data.get('access_token')
-            self.refresh_token = response_data.get('refresh_token')
-            self.token_expiry = datetime.now() + timedelta(minutes=30)
-            logger.info("Access token refreshed successfully.")
-        except Exception as e:
-            logger.error(f"Failed to refresh access token: {e}")
-            raise
+            try:
+                response = requests.post(token_url, data=payload, headers=headers)
+                response.raise_for_status()
+                response_data = response.json()
+                self.access_token = response_data.get('access_token')
+                self.refresh_token = response_data.get('refresh_token', self.refresh_token)
+                expires_in = response_data.get('expires_in', 1800)
+                self.token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                logger.info("Access token refreshed successfully.")
+            except Exception as e:
+                logger.error(f"Failed to refresh access token: {e}")
+                raise
 
     def ensure_token_validity(self):
         """Ensure the access token is still valid, refresh if necessary"""
-        if datetime.now() >= self.token_expiry - timedelta(minutes=5):
-            logger.info("Refreshing Shoeboxed access token...")
-            self.refresh_access_token()
+        with self.token_lock:
+            if not self.access_token or datetime.now(timezone.utc) + TOKEN_REFRESH_MARGIN >= self.token_expiry:
+                logger.info("Access token is expired or about to expire. Refreshing...")
+                self.refresh_access_token()
+
+    def get_headers(self):
+        """Get the headers for API requests"""
+        self.ensure_token_validity()
+        return {
+            'Authorization': f'Bearer {self.access_token}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'Your Application Name'
+        }
 
     def fetch_user_info(self):
         """Fetch user information from Shoeboxed API"""
-        self.ensure_token_validity()
-        url = "https://api.shoeboxed.com/v2/user"
-        headers = {
-            'Authorization': f'Bearer {self.access_token}',
-            'User-Agent': 'Your Application Name'
-        }
-        response = requests.get(url, headers=headers)
+        url = f"{self.api_url}/user"
+        response = requests.get(url, headers=self.get_headers())
         response.raise_for_status()
         user_info = response.json()
         account_ids = [account['id'] for account in user_info.get('accounts', [])]
@@ -171,19 +164,14 @@ class ShoeboxedClient:
 
     def fetch_documents(self, account_id):
         """Fetch all documents for a given account"""
-        self.ensure_token_validity()
         all_documents = []
-        base_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents"
+        base_url = f"{self.api_url}/accounts/{account_id}/documents"
         offset = 0
         limit = 100
 
         while True:
             url = f"{base_url}?offset={offset}&limit={limit}"
-            headers = {
-                'Authorization': f'Bearer {self.access_token}',
-                'User-Agent': 'Your Application Name'
-            }
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=self.get_headers())
             response.raise_for_status()
             data = response.json()
             documents = data.get('documents', [])
@@ -191,9 +179,19 @@ class ShoeboxedClient:
                 break
             all_documents.extend(documents)
             offset += limit
-            logger.info(f"Fetched {len(all_documents)} documents so far.")
+            logger.info(f"Fetched {len(all_documents)} documents so far for account {account_id}.")
 
         return all_documents
+
+    def fetch_document(self, account_id, document_id):
+        """Fetch a single document's data"""
+        url = f"{self.api_url}/accounts/{account_id}/documents/{document_id}"
+        response = requests.get(url, headers=self.get_headers())
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logger.error(f"Failed to fetch document {document_id}. Status Code: {response.status_code}, Response: {response.text}")
+            return None
 
 # ===========================
 # Paperless Client Class
@@ -521,7 +519,7 @@ class PaperlessClient:
             return None
 
     def poll_task_completion(self, task_id, timeout=600, interval=10):
-        """Poll for task completion and get document ID"""
+        """Poll for task completion and get document ID or handle failures immediately."""
         task_url = f"{self.url}/api/tasks/?task_id={task_id}"
         start_time = time.time()
 
@@ -529,15 +527,29 @@ class PaperlessClient:
             response = requests.get(task_url, headers=self.headers)
             if response.status_code == 200:
                 tasks = response.json()
-                if tasks and isinstance(tasks, list) and 'related_document' in tasks[0]:
-                    document_id = tasks[0]['related_document']
-                    if document_id:
-                        logger.info(f"Document ID obtained: {document_id}")
-                        # Adding a sleep to give the database some time to finalize the transaction
-                        time.sleep(2)
-                        return document_id
+                if tasks and isinstance(tasks, list) and len(tasks) > 0:
+                    task = tasks[0]
+                    status = task.get('status')
+                    if status == 'SUCCESS':
+                        document_id = task.get('related_document')
+                        if document_id:
+                            logger.info(f"Document ID obtained: {document_id}")
+                            # Adding a sleep to give the database some time to finalize the transaction
+                            time.sleep(2)
+                            return document_id
+                        else:
+                            logger.error(f"Task {task_id} succeeded but no related_document found.")
+                            return None
+                    elif status == 'FAILURE':
+                        error_message = task.get('result', 'Unknown error')
+                        logger.error(f"Task {task_id} failed with error: {error_message}")
+                        return 'FAILURE'  # Indicate failure
+                    else:
+                        logger.info(f"Task {task_id} status: {status}. Waiting...")
+                else:
+                    logger.error(f"Task {task_id} not found in response.")
             elif response.status_code == 404:
-                logger.warning(f"Task not found (404). Retrying after {interval} seconds...")
+                logger.warning(f"Task {task_id} not found (404). Retrying after {interval} seconds...")
             else:
                 logger.error(f"Failed to get task status. Status Code: {response.status_code}, Response: {response.text}")
                 return None
@@ -602,6 +614,7 @@ class DocumentProcessor:
     def __init__(self, shoeboxed_client, paperless_client):
         self.shoeboxed_client = shoeboxed_client
         self.paperless_client = paperless_client
+        self.max_retries = MAX_RETRIES
 
     def pre_process_metadata(self, all_documents):
         """Pre-process all documents to extract correspondents and tags"""
@@ -622,9 +635,20 @@ class DocumentProcessor:
         self.paperless_client.ensure_correspondents(list(correspondents_set))
         self.paperless_client.ensure_tags(list(tags_set))
 
-    def process_document(self, document):
-        """Process a single document"""
+    def process_document(self, document, attempt=1):
+        """Process a single document with retry logic."""
         try:
+            account_id = document.get('accountId')
+            document_id = document.get('id')
+
+            # Before processing, fetch the latest document data to get up-to-date attachment URL
+            latest_document = self.shoeboxed_client.fetch_document(account_id, document_id)
+            if not latest_document:
+                logger.error(f"Failed to fetch latest data for document {document_id}.")
+                return False
+
+            document = latest_document  # Update the document data with the latest
+
             # Map custom fields
             custom_field_values = self.map_custom_fields(document)
             custom_field_ids = list(custom_field_values.keys())
@@ -650,22 +674,32 @@ class DocumentProcessor:
                 tag_ids
             )
             if not task_id:
-                logger.error(f"Failed to upload document {document['id']}.")
+                logger.error(f"Failed to upload document {document_id}.")
                 return False
 
             # Poll for task completion
-            document_id = self.paperless_client.poll_task_completion(task_id)
-            if not document_id:
-                logger.error(f"Failed to process document {document['id']}.")
+            result = self.paperless_client.poll_task_completion(task_id)
+            if result == 'FAILURE':
+                if attempt < self.max_retries:
+                    logger.info(f"Retrying document {document_id} (Attempt {attempt + 1})")
+                    time.sleep(RETRY_DELAY)
+                    return self.process_document(document, attempt=attempt + 1)
+                else:
+                    logger.error(f"Maximum retry attempts reached for document {document_id}.")
+                    return False
+            elif not result:
+                logger.error(f"Failed to process document {document_id}.")
                 return False
 
-            # Update custom fields
-            self.paperless_client.update_custom_fields(document_id, custom_field_values)
+            paperless_document_id = result
 
-            logger.info(f"Document {document['id']} processed successfully.")
+            # Update custom fields
+            self.paperless_client.update_custom_fields(paperless_document_id, custom_field_values)
+
+            logger.info(f"Document {document_id} processed successfully.")
             return True
         except Exception as e:
-            logger.error(f"Error processing document {document['id']}: {e}")
+            logger.error(f"Error processing document {document_id}: {e}")
             return False
 
     def map_custom_fields(self, document):
@@ -682,7 +716,6 @@ class DocumentProcessor:
             extra_data = field_info.get('extra_data', {})
 
             # Implement your field mapping logic here
-            # For example:
             if field_name == 'Source Type' and data_type == 'select':
                 value = document.get('source', {}).get('type')
                 field_options = extra_data.get('select_options', [])
@@ -690,23 +723,21 @@ class DocumentProcessor:
                     index = field_options.index(value.lower())
                     field_mapping[field_id] = index
             elif field_name == 'Issued Date' and data_type == 'date':
-                # Convert datetime to date format (YYYY-MM-DD)
                 issued_date = document.get('issued')
                 if issued_date:
                     try:
                         date_value = datetime.fromisoformat(issued_date.replace("Z", "+00:00")).date().isoformat()
                         field_mapping[field_id] = date_value
                     except ValueError:
-                        logging.error(f"Invalid date format for 'issued': {issued_date}")
+                        logger.error(f"Invalid date format for 'issued': {issued_date}")
             elif field_name == 'Uploaded Date' and data_type == 'date':
-                # Convert datetime to date format (YYYY-MM-DD)
                 uploaded_date = document.get('uploaded')
                 if uploaded_date:
                     try:
                         date_value = datetime.fromisoformat(uploaded_date.replace("Z", "+00:00")).date().isoformat()
                         field_mapping[field_id] = date_value
                     except ValueError:
-                        logging.error(f"Invalid date format for 'uploaded': {uploaded_date}")
+                        logger.error(f"Invalid date format for 'uploaded': {uploaded_date}")
             elif field_name == 'Notes' and data_type == 'string':
                 field_mapping[field_id] = document.get('notes')
             elif field_name == 'Attachment Name' and data_type == 'string':
@@ -721,9 +752,11 @@ class DocumentProcessor:
             elif field_name == 'Invoice Number' and data_type == 'string':
                 field_mapping[field_id] = document.get('invoiceNumber')
             elif field_name == 'Tax' and data_type == 'monetary':
-                field_mapping[field_id] = document.get('tax')
+                tax_value = document.get('tax')
+                field_mapping[field_id] = self.format_monetary_value(tax_value, document.get('currency'))
             elif field_name == 'Total' and data_type == 'monetary':
-                field_mapping[field_id] = document.get('total')
+                total_value = document.get('total')
+                field_mapping[field_id] = self.format_monetary_value(total_value, document.get('currency'))
             elif field_name == 'Currency' and data_type == 'string':
                 field_mapping[field_id] = document.get('currency')
             elif field_name == 'Payment Type' and data_type == 'select':
@@ -733,7 +766,7 @@ class DocumentProcessor:
                     index = field_options.index(value.lower())
                     field_mapping[field_id] = index
             elif field_name == 'Card Last Four Digits' and data_type == 'string':
-                field_mapping[field_id] = document.get('paymentType.cardLastFourDigits')
+                field_mapping[field_id] = document.get('paymentType', {}).get('lastFourDigits')
             # Business Card specific fields
             elif field_name == 'First Name' and data_type == 'string':
                 field_mapping[field_id] = document.get('firstName')
@@ -755,6 +788,18 @@ class DocumentProcessor:
                 field_mapping[field_id] = document.get('website')
 
         return field_mapping
+    
+    def format_monetary_value(self, amount, currency):
+        """Format monetary value as required by Paperless"""
+        if amount is None:
+            return None
+        try:
+            # Round to two decimal places
+            formatted_amount = f"{currency}{amount:.2f}" if currency else f"{amount:.2f}"
+            return formatted_amount
+        except Exception as e:
+            logger.error(f"Error formatting monetary value: {e}")
+            return None
 
     def get_document_type_name(self, document):
         """Determine the document type name based on Shoeboxed document type"""
@@ -798,61 +843,6 @@ class DocumentProcessor:
                 tags.add(envelope_id.upper())
 
         return tags
-    
-    def retry_failed_documents(self, failed_tasks):
-        """Retry failed documents based on the tasks endpoint."""
-        retry_counts = self.load_retry_counts()
-
-        for task in failed_tasks:
-            document_id = task.get('task_file_name')
-            if not document_id:
-                continue
-
-            # Check if we've already retried this document too many times
-            retry_count = retry_counts.get(document_id, 0)
-            if retry_count >= MAX_RETRY_ATTEMPTS:
-                logger.warning(f"Maximum retry attempts reached for document {document_id}. Skipping.")
-                continue
-
-            # Find the original document data
-            original_document = next((doc for doc in self.all_documents if doc['id'] == document_id), None)
-            if not original_document:
-                logger.error(f"Original document data not found for document ID {document_id}.")
-                continue
-
-            logger.info(f"Retrying document {document_id} (Attempt {retry_count + 1})")
-
-            # Retry processing the document
-            result = self.process_document(original_document)
-
-            if result:
-                logger.info(f"Document {document_id} retried successfully.")
-                # Optionally, remove the task from the failed tasks list
-            else:
-                logger.error(f"Document {document_id} retry failed.")
-                # Increment the retry count
-                retry_counts[document_id] = retry_count + 1
-
-        # Save the updated retry counts
-        self.save_retry_counts(retry_counts)
-
-    def load_retry_counts(self):
-        """Load retry counts from a persistent storage."""
-        try:
-            with shelve.open('retry_counts.db') as db:
-                return dict(db)
-        except Exception as e:
-            logger.error(f"Failed to load retry counts: {e}")
-            return {}
-
-    def save_retry_counts(self, retry_counts):
-        """Save retry counts to a persistent storage."""
-        try:
-            with shelve.open('retry_counts.db') as db:
-                for key, value in retry_counts.items():
-                    db[key] = value
-        except Exception as e:
-            logger.error(f"Failed to save retry counts: {e}")
 
 # ===========================
 # Main Function
@@ -884,8 +874,6 @@ def main():
         exit(1)
 
     # Step 3: Process documents
-    progress = load_progress()
-    current_batch = progress.get('current_batch', 0)
     document_processor = DocumentProcessor(shoeboxed_client, paperless_client)
 
     all_documents = []
@@ -897,9 +885,6 @@ def main():
         except Exception as e:
             logger.error(f"Failed to fetch documents for account {account_id}: {e}")
             continue
-
-    # Assign all_documents to the document_processor for access during retries
-    document_processor.all_documents = all_documents
 
     # Pre-process metadata to avoid race conditions
     document_processor.pre_process_metadata(all_documents)
@@ -916,19 +901,10 @@ def main():
                 result = future.result()
                 if result:
                     logger.info(f"Document {document['id']} processed successfully.")
-                    current_batch += 1
-                    progress['current_batch'] = current_batch
-                    save_progress(progress)
                 else:
                     logger.error(f"Document {document['id']} failed to process.")
             except Exception as exc:
                 logger.error(f"Document {document['id']} generated an exception: {exc}")
-
-    # Step 4: Retry failed tasks
-    failed_tasks = paperless_client.fetch_failed_tasks()
-    if failed_tasks:
-        logger.info(f"Retrying {len(failed_tasks)} failed document uploads...")
-        document_processor.retry_failed_documents(failed_tasks)
 
     logger.info("Document migration completed successfully.")
 
