@@ -5,7 +5,7 @@ IMG ?= $(REGISTRY)/$(REPO):$(TAG)
 
 .PHONY: build
 build:
-  docker build -t $(IMG) .
+  docker build -t $(IMG) . -f Containerfile
 
 .PHONY: push
 push:
