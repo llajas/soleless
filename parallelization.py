@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import concurrent.futures
 from requests.exceptions import RequestException
 from urllib.parse import quote_plus
+import shelve
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -14,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 # Constants
 MAX_WORKERS = 5
-MAX_RETRIES = 3
+MAX_RETRIES = 5
+MAX_RETRY_ATTEMPTS = 5
 RETRY_DELAY = 5  # seconds
 TOKEN_REFRESH_INTERVAL = timedelta(minutes=25)  # Refresh 5 minutes before expiration
 PROGRESS_FILE = "progress.json"
@@ -573,15 +575,24 @@ class PaperlessClient:
 
     def fetch_failed_tasks(self):
         """Fetches all tasks with a FAILURE status from the Paperless API."""
-        task_url = f"{self.url}/api/tasks/?status=FAILURE"
-        response = requests.get(task_url, headers=self.headers)
-        if response.status_code == 200:
-            tasks = response.json()
-            failed_tasks = tasks.get('results', [])
-            return failed_tasks
-        else:
-            logger.error(f"Failed to fetch tasks. Status Code: {response.status_code}, Response: {response.text}")
-            return []
+        failed_tasks = []
+        page = 1
+        while True:
+            task_url = f"{self.url}/api/tasks/?status=FAILURE&page={page}"
+            response = requests.get(task_url, headers=self.headers)
+            if response.status_code == 200:
+                data = response.json()
+                tasks = data.get('results', [])
+                if not tasks:
+                    break
+                failed_tasks.extend(tasks)
+                if not data.get('next'):
+                    break
+                page += 1
+            else:
+                logger.error(f"Failed to fetch tasks. Status Code: {response.status_code}, Response: {response.text}")
+                break
+        return failed_tasks
 
 # ===========================
 # Document Processor Class
@@ -787,6 +798,61 @@ class DocumentProcessor:
                 tags.add(envelope_id.upper())
 
         return tags
+    
+    def retry_failed_documents(self, failed_tasks):
+        """Retry failed documents based on the tasks endpoint."""
+        retry_counts = self.load_retry_counts()
+
+        for task in failed_tasks:
+            document_id = task.get('task_file_name')
+            if not document_id:
+                continue
+
+            # Check if we've already retried this document too many times
+            retry_count = retry_counts.get(document_id, 0)
+            if retry_count >= MAX_RETRY_ATTEMPTS:
+                logger.warning(f"Maximum retry attempts reached for document {document_id}. Skipping.")
+                continue
+
+            # Find the original document data
+            original_document = next((doc for doc in self.all_documents if doc['id'] == document_id), None)
+            if not original_document:
+                logger.error(f"Original document data not found for document ID {document_id}.")
+                continue
+
+            logger.info(f"Retrying document {document_id} (Attempt {retry_count + 1})")
+
+            # Retry processing the document
+            result = self.process_document(original_document)
+
+            if result:
+                logger.info(f"Document {document_id} retried successfully.")
+                # Optionally, remove the task from the failed tasks list
+            else:
+                logger.error(f"Document {document_id} retry failed.")
+                # Increment the retry count
+                retry_counts[document_id] = retry_count + 1
+
+        # Save the updated retry counts
+        self.save_retry_counts(retry_counts)
+
+    def load_retry_counts(self):
+        """Load retry counts from a persistent storage."""
+        try:
+            with shelve.open('retry_counts.db') as db:
+                return dict(db)
+        except Exception as e:
+            logger.error(f"Failed to load retry counts: {e}")
+            return {}
+
+    def save_retry_counts(self, retry_counts):
+        """Save retry counts to a persistent storage."""
+        try:
+            with shelve.open('retry_counts.db') as db:
+                for key, value in retry_counts.items():
+                    db[key] = value
+        except Exception as e:
+            logger.error(f"Failed to save retry counts: {e}")
 
 # ===========================
 # Main Function
@@ -832,6 +898,9 @@ def main():
             logger.error(f"Failed to fetch documents for account {account_id}: {e}")
             continue
 
+    # Assign all_documents to the document_processor for access during retries
+    document_processor.all_documents = all_documents
+
     # Pre-process metadata to avoid race conditions
     document_processor.pre_process_metadata(all_documents)
 
@@ -850,6 +919,8 @@ def main():
                     current_batch += 1
                     progress['current_batch'] = current_batch
                     save_progress(progress)
+                else:
+                    logger.error(f"Document {document['id']} failed to process.")
             except Exception as exc:
                 logger.error(f"Document {document['id']} generated an exception: {exc}")
 
@@ -857,7 +928,7 @@ def main():
     failed_tasks = paperless_client.fetch_failed_tasks()
     if failed_tasks:
         logger.info(f"Retrying {len(failed_tasks)} failed document uploads...")
-        # Implement retry logic similar to your existing code
+        document_processor.retry_failed_documents(failed_tasks)
 
     logger.info("Document migration completed successfully.")
 
