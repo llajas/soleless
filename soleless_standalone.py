@@ -772,7 +772,8 @@ class DocumentProcessor:
                     index = field_options.index(value.lower())
                     field_mapping[field_id] = index
             elif field_name == 'Card Last Four Digits' and data_type == 'string':
-                field_mapping[field_id] = document.get('paymentType', {}).get('lastFourDigits')
+                payment_type = document.get('paymentType') or {}
+                field_mapping[field_id] = payment_type.get('lastFourDigits')
             # Business Card specific fields
             elif field_name == 'First Name' and data_type == 'string':
                 field_mapping[field_id] = document.get('firstName')
