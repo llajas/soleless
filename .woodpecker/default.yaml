@@ -7,8 +7,7 @@ steps:
       dockerfile: Containerfile
       tags:
         - latest
-        - $CI_COMMIT_SHA
-        - $(git describe --tags --always --dirty)
+        - ${CI_COMMIT_SHA}
       username:
         from_secret: registry_username
       password:
