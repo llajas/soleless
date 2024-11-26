@@ -619,6 +619,25 @@ class PaperlessClient:
                 break
         return failed_tasks
     
+    def check_task_status(self, task_id):
+        """Check the status of a task without blocking."""
+        task_url = f"{self.url}/api/tasks/?task_id={task_id}"
+        response = requests.get(task_url, headers=self.headers)
+        if response.status_code == 200:
+            data = response.json()
+            tasks = data.get('results', [])
+            if tasks and len(tasks) > 0:
+                task = tasks[0]
+                status = task.get('status')
+                document_id = task.get('related_document')
+                return status, document_id
+            else:
+                logger.error(f"Task {task_id} not found in response.")
+                return None, None
+        else:
+            logger.error(f"Failed to get task status for {task_id}. Status Code: {response.status_code}, Response: {response.text}")
+            return None, None
+    
 # ===========================
 # Document Processor Class
 # ===========================
