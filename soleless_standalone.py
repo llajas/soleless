@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 import concurrent.futures
 import threading
+from queue import Queue
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -16,6 +17,8 @@ MAX_WORKERS = int(os.getenv('MAX_WORKERS', 5))
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', 3))
 RETRY_DELAY = int(os.getenv('RETRY_DELAY', 5))  # seconds
 TOKEN_REFRESH_MARGIN = timedelta(minutes=5)  # Refresh 5 minutes before expiration
+TASK_POLL_INTERVAL = int(os.getenv('TASK_POLL_INTERVAL', 10))  # seconds
+TASK_TIMEOUT = int(os.getenv('TASK_TIMEOUT', 600))  # seconds
 
 # ===========================
 # Utility Functions
@@ -605,15 +608,16 @@ class PaperlessClient:
                 logger.error(f"Failed to fetch tasks. Status Code: {response.status_code}, Response: {response.text}")
                 break
         return failed_tasks
-
+    
 # ===========================
 # Document Processor Class
 # ===========================
 
 class DocumentProcessor:
-    def __init__(self, shoeboxed_client, paperless_client):
+    def __init__(self, shoeboxed_client, paperless_client, task_queue):
         self.shoeboxed_client = shoeboxed_client
         self.paperless_client = paperless_client
+        self.task_queue = task_queue
         self.max_retries = MAX_RETRIES
 
     def pre_process_metadata(self, all_documents):
@@ -636,12 +640,12 @@ class DocumentProcessor:
         self.paperless_client.ensure_tags(list(tags_set))
 
     def process_document(self, document, attempt=1):
-        """Process a single document with retry logic."""
+        """Process a single document and add the task to the queue."""
         try:
             account_id = document.get('accountId')
             document_id = document.get('id')
 
-            # Before processing, fetch the latest document data to get up-to-date attachment URL
+            # Fetch the latest document data
             latest_document = self.shoeboxed_client.fetch_document(account_id, document_id)
             if not latest_document:
                 logger.error(f"Failed to fetch latest data for document {document_id}.")
@@ -677,26 +681,16 @@ class DocumentProcessor:
                 logger.error(f"Failed to upload document {document_id}.")
                 return False
 
-            # Poll for task completion
-            result = self.paperless_client.poll_task_completion(task_id)
-            if result == 'FAILURE':
-                if attempt < self.max_retries:
-                    logger.info(f"Retrying document {document_id} (Attempt {attempt + 1})")
-                    time.sleep(RETRY_DELAY)
-                    return self.process_document(document, attempt=attempt + 1)
-                else:
-                    logger.error(f"Maximum retry attempts reached for document {document_id}.")
-                    return False
-            elif not result:
-                logger.error(f"Failed to process document {document_id}.")
-                return False
+            # Add task to the queue for monitoring
+            task_info = {
+                'task_id': task_id,
+                'document_id': document_id,
+                'custom_field_values': custom_field_values,
+                'attempt': attempt
+            }
+            self.task_queue.put(task_info)
+            logger.info(f"Task {task_id} for document {document_id} added to the task queue.")
 
-            paperless_document_id = result
-
-            # Update custom fields
-            self.paperless_client.update_custom_fields(paperless_document_id, custom_field_values)
-
-            logger.info(f"Document {document_id} processed successfully.")
             return True
         except Exception as e:
             logger.error(f"Error processing document {document_id}: {e}")
@@ -842,7 +836,77 @@ class DocumentProcessor:
             if envelope_id:
                 tags.add(envelope_id.upper())
 
-        return tags
+        return tags    
+
+# ===========================
+# Task Monitor Class
+# ===========================
+
+class TaskMonitor(threading.Thread):
+    def __init__(self, task_queue, paperless_client):
+        super().__init__()
+        self.task_queue = task_queue
+        self.paperless_client = paperless_client
+        self.daemon = True  # Allows the thread to exit when the main program exits
+        self.running = True
+        self.pending_tasks = {}  # task_id: task_info
+
+    def run(self):
+        while self.running or not self.task_queue.empty() or self.pending_tasks:
+            # Process tasks from the queue
+            while not self.task_queue.empty():
+                task_info = self.task_queue.get()
+                task_id = task_info['task_id']
+                self.pending_tasks[task_id] = {
+                    'task_info': task_info,
+                    'start_time': time.time()
+                }
+                logger.info(f"Monitoring started for task {task_id}")
+
+            # Check the status of pending tasks
+            completed_tasks = []
+            for task_id, task_data in self.pending_tasks.items():
+                task_info = task_data['task_info']
+                start_time = task_data['start_time']
+
+                # Check for timeout
+                if time.time() - start_time > TASK_TIMEOUT:
+                    logger.error(f"Task {task_id} for document {task_info['document_id']} timed out.")
+                    completed_tasks.append(task_id)
+                    continue
+
+                # Poll task status
+                status, document_id = self.paperless_client.check_task_status(task_id)
+                if status == 'SUCCESS':
+                    logger.info(f"Task {task_id} completed successfully for document {task_info['document_id']}.")
+                    # Update custom fields
+                    self.paperless_client.update_custom_fields(document_id, task_info['custom_field_values'])
+                    completed_tasks.append(task_id)
+                elif status == 'FAILURE':
+                    logger.error(f"Task {task_id} failed for document {task_info['document_id']}.")
+                    # Handle retries if applicable
+                    attempt = task_info['attempt']
+                    if attempt < MAX_RETRIES:
+                        logger.info(f"Retrying document {task_info['document_id']} (Attempt {attempt + 1})")
+                        # Re-upload the document and re-add to the queue
+                        document_processor = task_info.get('document_processor')
+                        if document_processor:
+                            document_processor.process_document(task_info['document'], attempt=attempt + 1)
+                    else:
+                        logger.error(f"Maximum retry attempts reached for document {task_info['document_id']}.")
+                    completed_tasks.append(task_id)
+                else:
+                    logger.debug(f"Task {task_id} status: {status}")
+
+            # Remove completed tasks
+            for task_id in completed_tasks:
+                del self.pending_tasks[task_id]
+
+            time.sleep(TASK_POLL_INTERVAL)
+
+    def stop(self):
+        self.running = False
+
 
 # ===========================
 # Main Function
@@ -873,8 +937,13 @@ def main():
         logger.error(f"Failed to fetch Shoeboxed user info: {e}")
         exit(1)
 
-    # Step 3: Process documents
-    document_processor = DocumentProcessor(shoeboxed_client, paperless_client)
+    # Step 3: Prepare task queue and start task monitor
+    task_queue = Queue()
+    task_monitor = TaskMonitor(task_queue, paperless_client)
+    task_monitor.start()
+
+    # Step 4: Process documents
+    document_processor = DocumentProcessor(shoeboxed_client, paperless_client, task_queue)
 
     all_documents = []
 
@@ -891,20 +960,27 @@ def main():
 
     # Process documents concurrently
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_document = {
-            executor.submit(document_processor.process_document, document): document for document in all_documents
-        }
+        futures = [executor.submit(document_processor.process_document, document) for document in all_documents]
 
-        for future in concurrent.futures.as_completed(future_to_document):
-            document = future_to_document[future]
+        # Wait for all document processing tasks to complete
+        for future in concurrent.futures.as_completed(futures):
             try:
                 result = future.result()
                 if result:
-                    logger.info(f"Document {document['id']} processed successfully.")
+                    logger.info("Document processed successfully.")
                 else:
-                    logger.error(f"Document {document['id']} failed to process.")
+                    logger.error("Document failed to process.")
             except Exception as exc:
-                logger.error(f"Document {document['id']} generated an exception: {exc}")
+                logger.error(f"Document processing generated an exception: {exc}")
+
+    # Wait for all tasks in the queue to be processed
+    while not task_queue.empty() or task_monitor.pending_tasks:
+        logger.info("Waiting for all tasks to complete...")
+        time.sleep(TASK_POLL_INTERVAL)
+
+    # Stop the task monitor
+    task_monitor.stop()
+    task_monitor.join()
 
     logger.info("Document migration completed successfully.")
 
