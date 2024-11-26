@@ -708,7 +708,14 @@ class DocumentProcessor:
             )
             if not task_id:
                 logger.error(f"Failed to upload document {document_id}.")
-                return False
+                # Add retry logic here
+                if attempt < self.max_retries:
+                    logger.info(f"Retrying upload for document {document_id} (Attempt {attempt + 1})")
+                    time.sleep(RETRY_DELAY)
+                    return self.process_document(document, attempt=attempt + 1)
+                else:
+                    logger.error(f"Maximum retry attempts reached for document {document_id}.")
+                    return False
 
             # Add task to the queue for monitoring
             task_info = {
