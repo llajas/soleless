@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', 5))
-MAX_RETRIES = int(os.getenv('MAX_RETRIES', 3))
+MAX_RETRIES = int(os.getenv('MAX_RETRIES', 5))
 RETRY_DELAY = int(os.getenv('RETRY_DELAY', 5))  # seconds
 TOKEN_REFRESH_MARGIN = timedelta(minutes=5)  # Refresh 5 minutes before expiration
 TASK_POLL_INTERVAL = int(os.getenv('TASK_POLL_INTERVAL', 10))  # seconds
