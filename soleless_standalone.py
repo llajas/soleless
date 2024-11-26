@@ -475,12 +475,12 @@ class PaperlessClient:
         # Download the file from Shoeboxed
         if not file_url or not file_name:
             logger.error(f"Document {document.get('id')} is missing attachment information.")
-            return None
+            return None, None  # Return None for both task_id and status_code
 
         file_response = requests.get(file_url, headers={'User-Agent': 'Your Application Name'})
         if file_response.status_code != 200:
             logger.error(f"Failed to download file for document {document.get('id')}. Status Code: {file_response.status_code}")
-            return None
+            return None, file_response.status_code
         file_content = file_response.content
 
         # Prepare the upload payload
@@ -526,10 +526,10 @@ class PaperlessClient:
                 # If response is a plain UUID string
                 task_id = response.text.strip('"')
             logger.info(f"Document {document.get('id')} uploaded successfully. Task ID: {task_id}")
-            return task_id
+            return task_id, response.status_code  # Return task_id and status_code
         else:
             logger.error(f"Failed to upload document {document.get('id')}. Status Code: {response.status_code}, Response: {response.text}")
-            return None, response.status_code
+            return None, response.status_code  # Return None and status_code
 
     def poll_task_completion(self, task_id, timeout=600, interval=10):
         """Poll for task completion and get document ID or handle failures immediately."""
