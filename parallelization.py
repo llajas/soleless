@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timedelta
 import concurrent.futures
 from requests.exceptions import RequestException
+from urllib.parse import quote_plus
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -225,15 +226,6 @@ class PaperlessClient:
 
     def ensure_custom_fields(self):
         """Ensure custom fields exist in Paperless and create mappings"""
-        # Use your existing ensure_custom_fields function logic here
-        # Then populate self.custom_field_mapping with field name to ID mapping
-
-        # For brevity, assuming ensure_custom_fields function is implemented
-        custom_fields_list = self._ensure_custom_fields()
-        self.custom_field_mapping = {field['name']: field for field in custom_fields_list}
-
-    def _ensure_custom_fields(self):
-        """Implement the logic to ensure custom fields exist"""
         # Fetch existing custom fields
         response = requests.get(
             f"{self.url}/api/custom_fields/",
@@ -288,7 +280,7 @@ class PaperlessClient:
                 }
                 create_response = requests.post(
                     f"{self.url}/api/custom_fields/",
-                    headers=self.headers,
+                    headers={**self.headers, "Content-Type": "application/json"},
                     json=payload
                 )
                 if create_response.status_code == 201:
@@ -303,17 +295,13 @@ class PaperlessClient:
         )
         if response.status_code == 200:
             updated_fields = response.json().get('results', [])
-            logger.info("Fetched updated custom fields after creation.")
-            return updated_fields
+            self.custom_field_mapping = {field['name']: field for field in updated_fields}
+            logger.info("Custom field mapping created.")
         else:
             logger.error(f"Failed to fetch updated custom fields. Status Code: {response.status_code}, Response: {response.text}")
-            return []
 
     def ensure_document_types(self):
         """Ensure document types exist in Paperless and create mappings"""
-        # Similar to your existing ensure_document_types function
-        # Populate self.document_type_mapping with type name to ID mapping
-
         # Fetch existing document types
         response = requests.get(f"{self.url}/api/document_types/", headers=self.headers)
         if response.status_code == 200:
@@ -337,7 +325,7 @@ class PaperlessClient:
             if not existing_type:
                 create_response = requests.post(
                     f"{self.url}/api/document_types/",
-                    headers=self.headers,
+                    headers={**self.headers, "Content-Type": "application/json"},
                     json=doc_type
                 )
                 if create_response.status_code == 201:
@@ -350,82 +338,250 @@ class PaperlessClient:
         if response.status_code == 200:
             updated_types = response.json().get('results', [])
             self.document_type_mapping = {doc_type['name']: doc_type['id'] for doc_type in updated_types}
-            logger.info("Fetched updated document types after creation.")
+            logger.info("Document type mapping created.")
         else:
             logger.error(f"Failed to fetch updated document types. Status Code: {response.status_code}, Response: {response.text}")
 
     def ensure_correspondents(self, correspondents_list):
         """Ensure all correspondents exist in Paperless and create mapping"""
         # Fetch existing correspondents
-        response = requests.get(f"{self.url}/api/correspondents/", headers=self.headers)
-        if response.status_code == 200:
-            existing_correspondents = response.json().get('results', [])
-        else:
-            logger.error(f"Failed to fetch correspondents. Status Code: {response.status_code}, Response: {response.text}")
-            existing_correspondents = []
-
-        existing_correspondent_names = {correspondent['name']: correspondent['id'] for correspondent in existing_correspondents}
+        existing_correspondent_names = self.get_existing_correspondents()
 
         # Create missing correspondents
         for name in correspondents_list:
             if name and name not in existing_correspondent_names:
-                payload = {"name": name}
-                create_response = requests.post(f"{self.url}/api/correspondents/", headers=self.headers, json=payload)
-                if create_response.status_code == 201:
-                    new_correspondent = create_response.json()
-                    existing_correspondent_names[name] = new_correspondent['id']
-                    logger.info(f"Correspondent '{name}' created successfully.")
-                else:
-                    logger.error(f"Failed to create correspondent '{name}'. Status Code: {create_response.status_code}, Response: {create_response.text}")
+                correspondent_id = self.create_correspondent(name)
+                if correspondent_id:
+                    existing_correspondent_names[name] = correspondent_id
 
         self.correspondent_mapping = existing_correspondent_names
+
+    def get_existing_correspondents(self):
+        """Fetch existing correspondents and return a name-to-ID mapping"""
+        existing_correspondent_names = {}
+        page = 1
+        while True:
+            response = requests.get(f"{self.url}/api/correspondents/?page={page}", headers=self.headers)
+            if response.status_code == 200:
+                data = response.json()
+                results = data.get('results', [])
+                if not results:
+                    break
+                for correspondent in results:
+                    existing_correspondent_names[correspondent['name']] = correspondent['id']
+                if not data.get('next'):
+                    break
+                page += 1
+            else:
+                logger.error(f"Failed to fetch correspondents. Status Code: {response.status_code}, Response: {response.text}")
+                break
+        return existing_correspondent_names
+    
+    def create_correspondent(self, name):
+        """Create a new correspondent and return its ID"""
+        payload = {"name": name}
+        create_response = requests.post(
+            f"{self.url}/api/correspondents/",
+            headers={**self.headers, "Content-Type": "application/json"},
+            json=payload
+        )
+        if create_response.status_code == 201:
+            new_correspondent = create_response.json()
+            logger.info(f"Correspondent '{name}' created successfully.")
+            return new_correspondent['id']
+        elif create_response.status_code == 400 and "unique constraint" in create_response.text:
+            # Correspondent already exists, fetch its ID
+            existing_correspondents = self.get_existing_correspondents()
+            return existing_correspondents.get(name)
+        else:
+            logger.error(f"Failed to create correspondent '{name}'. Status Code: {create_response.status_code}, Response: {create_response.text}")
+            return None
 
     def ensure_tags(self, tags_list):
         """Ensure all tags exist in Paperless and create mapping"""
         # Fetch existing tags
-        response = requests.get(f"{self.url}/api/tags/", headers=self.headers)
-        if response.status_code == 200:
-            existing_tags = response.json().get('results', [])
-        else:
-            logger.error(f"Failed to fetch tags. Status Code: {response.status_code}, Response: {response.text}")
-            existing_tags = []
-
-        existing_tag_names = {tag['name']: tag['id'] for tag in existing_tags}
+        existing_tag_names = self.get_existing_tags()
 
         # Create missing tags
         for name in tags_list:
             if name and name not in existing_tag_names:
-                payload = {"name": name}
-                create_response = requests.post(f"{self.url}/api/tags/", headers=self.headers, json=payload)
-                if create_response.status_code == 201:
-                    new_tag = create_response.json()
-                    existing_tag_names[name] = new_tag['id']
-                    logger.info(f"Tag '{name}' created successfully.")
-                else:
-                    logger.error(f"Failed to create tag '{name}'. Status Code: {create_response.status_code}, Response: {create_response.text}")
+                tag_id = self.create_tag(name)
+                if tag_id:
+                    existing_tag_names[name] = tag_id
 
         self.tag_mapping = existing_tag_names
 
+    def get_existing_tags(self):
+        """Fetch existing tags and return a name-to-ID mapping"""
+        existing_tag_names = {}
+        page = 1
+        while True:
+            response = requests.get(f"{self.url}/api/tags/?page={page}", headers=self.headers)
+            if response.status_code == 200:
+                data = response.json()
+                results = data.get('results', [])
+                if not results:
+                    break
+                for tag in results:
+                    existing_tag_names[tag['name']] = tag['id']
+                if not data.get('next'):
+                    break
+                page += 1
+            else:
+                logger.error(f"Failed to fetch tags. Status Code: {response.status_code}, Response: {response.text}")
+                break
+        return existing_tag_names
+
+    def create_tag(self, name):
+        """Create a new tag and return its ID"""
+        payload = {"name": name}
+        create_response = requests.post(
+            f"{self.url}/api/tags/",
+            headers={**self.headers, "Content-Type": "application/json"},
+            json=payload
+        )
+        if create_response.status_code == 201:
+            new_tag = create_response.json()
+            logger.info(f"Tag '{name}' created successfully.")
+            return new_tag['id']
+        elif create_response.status_code == 400 and "unique constraint" in create_response.text:
+            # Tag already exists, fetch its ID
+            existing_tags = self.get_existing_tags()
+            return existing_tags.get(name)
+        else:
+            logger.error(f"Failed to create tag '{name}'. Status Code: {create_response.status_code}, Response: {create_response.text}")
+            return None
+
     def upload_document(self, document, custom_field_ids, correspondent_id, document_type_id, tag_ids):
         """Upload a document to Paperless"""
-        # Implement logic similar to your existing upload_document_to_paperless function
-        # Use the mappings and IDs provided
-        pass  # Implement logic here
+        # Extract the necessary data
+        file_url = document.get('attachment', {}).get('url')
+        file_name = document.get('id')
+        document_type = document.get('type', 'other')  # Default to 'other' if type is not provided
 
-    def poll_task_completion(self, task_id):
+        # Download the file from Shoeboxed
+        if not file_url or not file_name:
+            logger.error(f"Document {document.get('id')} is missing attachment information.")
+            return None
+
+        file_response = requests.get(file_url, headers={'User-Agent': 'Your Application Name'})
+        if file_response.status_code != 200:
+            logger.error(f"Failed to download file for document {document.get('id')}. Status Code: {file_response.status_code}")
+            return None
+        file_content = file_response.content
+
+        # Prepare the upload payload
+        # Determine the appropriate 'created' date based on document type
+        if document.get('type') == 'business-card':
+            created_date = document.get('uploaded')
+        else:
+            created_date = document.get('issued')
+
+        files = [
+            ('document', (file_name, file_content)),
+            ('title', (None, document.get('title', file_name))),
+            ('created', (None, created_date)),
+        ]
+
+        # Include the correspondent if available
+        if correspondent_id:
+            files.append(('correspondent', (None, str(correspondent_id))))
+
+        # Include custom field IDs (without values)
+        for field_id in custom_field_ids:
+            files.append(('custom_fields', (None, str(field_id))))
+
+        # Include document type ID
+        if document_type_id:
+            files.append(('document_type', (None, str(document_type_id))))
+        else:
+            logger.warning(f"Document type ID not found. Skipping document type association.")
+
+        # Include tags
+        for tag_id in tag_ids:
+            files.append(('tags', (None, str(tag_id))))
+
+        # Upload the document to Paperless
+        upload_url = f"{self.url}/api/documents/post_document/"
+        response = requests.post(upload_url, headers=self.headers, files=files)
+        if response.status_code in [200, 202]:
+            # Handle response based on status code
+            if response.status_code == 202:
+                # If response is JSON with task_id
+                task_id = response.json().get('task_id')
+            elif response.status_code == 200:
+                # If response is a plain UUID string
+                task_id = response.text.strip('"')
+            logger.info(f"Document {document.get('id')} uploaded successfully. Task ID: {task_id}")
+            return task_id
+        else:
+            logger.error(f"Failed to upload document {document.get('id')}. Status Code: {response.status_code}, Response: {response.text}")
+            return None
+
+    def poll_task_completion(self, task_id, timeout=600, interval=10):
         """Poll for task completion and get document ID"""
-        # Implement logic similar to your existing poll_for_task_completion function
-        pass  # Implement logic here
+        task_url = f"{self.url}/api/tasks/?task_id={task_id}"
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            response = requests.get(task_url, headers=self.headers)
+            if response.status_code == 200:
+                tasks = response.json()
+                if tasks and isinstance(tasks, list) and 'related_document' in tasks[0]:
+                    document_id = tasks[0]['related_document']
+                    if document_id:
+                        logger.info(f"Document ID obtained: {document_id}")
+                        # Adding a sleep to give the database some time to finalize the transaction
+                        time.sleep(2)
+                        return document_id
+            elif response.status_code == 404:
+                logger.warning(f"Task not found (404). Retrying after {interval} seconds...")
+            else:
+                logger.error(f"Failed to get task status. Status Code: {response.status_code}, Response: {response.text}")
+                return None
+            time.sleep(interval)
+
+        logger.error(f"Timeout exceeded while waiting for task {task_id} to complete.")
+        return None
 
     def update_custom_fields(self, document_id, custom_field_values):
         """Update custom fields for a document"""
-        # Implement logic similar to your existing update_document_custom_fields function
-        pass  # Implement logic here
+        # Filter out fields with null values
+        filtered_custom_field_values = {field_id: value for field_id, value in custom_field_values.items() if value is not None}
+
+        if not filtered_custom_field_values:
+            logger.info(f"No valid custom fields to update for document {document_id}.")
+            return True
+
+        def operation():
+            update_url = f"{self.url}/api/documents/{document_id}/"
+            payload = {
+                "custom_fields": [{"field": field_id, "value": value} for field_id, value in filtered_custom_field_values.items()]
+            }
+            response = requests.patch(update_url, headers={**self.headers, 'Content-Type': 'application/json'}, json=payload)
+            if response.status_code in [200, 204]:
+                logger.info(f"Custom fields for document {document_id} updated successfully.")
+                return True
+            else:
+                raise requests.exceptions.RequestException(f"Failed to update custom fields for document {document_id}. Status Code: {response.status_code}, Response: {response.text}")
+
+        try:
+            return retry_operation(operation)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to update document custom fields for {document_id} after retries: {e}")
+            return False
 
     def fetch_failed_tasks(self):
-        """Fetch failed tasks from Paperless"""
-        # Implement logic similar to your existing fetch_failed_tasks function
-        pass  # Implement logic here
+        """Fetches all tasks with a FAILURE status from the Paperless API."""
+        task_url = f"{self.url}/api/tasks/?status=FAILURE"
+        response = requests.get(task_url, headers=self.headers)
+        if response.status_code == 200:
+            tasks = response.json()
+            failed_tasks = tasks.get('results', [])
+            return failed_tasks
+        else:
+            logger.error(f"Failed to fetch tasks. Status Code: {response.status_code}, Response: {response.text}")
+            return []
 
 # ===========================
 # Document Processor Class
@@ -503,9 +659,91 @@ class DocumentProcessor:
 
     def map_custom_fields(self, document):
         """Map Shoeboxed document metadata to Paperless custom fields"""
-        # Implement logic similar to your existing map_custom_fields function
-        # Use self.paperless_client.custom_field_mapping
-        pass  # Implement logic here
+        field_mapping = {}
+
+        # Use the custom_field_mapping from the PaperlessClient
+        custom_field_mapping = self.paperless_client.custom_field_mapping
+
+        # Iterate through available custom fields and set values accordingly
+        for field_name, field_info in custom_field_mapping.items():
+            field_id = field_info['id']
+            data_type = field_info['data_type']
+            extra_data = field_info.get('extra_data', {})
+
+            # Implement your field mapping logic here
+            # For example:
+            if field_name == 'Source Type' and data_type == 'select':
+                value = document.get('source', {}).get('type')
+                field_options = extra_data.get('select_options', [])
+                if value and value.lower() in field_options:
+                    index = field_options.index(value.lower())
+                    field_mapping[field_id] = index
+            elif field_name == 'Issued Date' and data_type == 'date':
+                # Convert datetime to date format (YYYY-MM-DD)
+                issued_date = document.get('issued')
+                if issued_date:
+                    try:
+                        date_value = datetime.fromisoformat(issued_date.replace("Z", "+00:00")).date().isoformat()
+                        field_mapping[field_id] = date_value
+                    except ValueError:
+                        logging.error(f"Invalid date format for 'issued': {issued_date}")
+            elif field_name == 'Uploaded Date' and data_type == 'date':
+                # Convert datetime to date format (YYYY-MM-DD)
+                uploaded_date = document.get('uploaded')
+                if uploaded_date:
+                    try:
+                        date_value = datetime.fromisoformat(uploaded_date.replace("Z", "+00:00")).date().isoformat()
+                        field_mapping[field_id] = date_value
+                    except ValueError:
+                        logging.error(f"Invalid date format for 'uploaded': {uploaded_date}")
+            elif field_name == 'Notes' and data_type == 'string':
+                field_mapping[field_id] = document.get('notes')
+            elif field_name == 'Attachment Name' and data_type == 'string':
+                field_mapping[field_id] = document.get('attachment', {}).get('name')
+            elif field_name == 'Attachment URL' and data_type == 'url':
+                field_mapping[field_id] = document.get('attachment', {}).get('url')
+            elif field_name == 'Shoeboxed Document ID' and data_type == 'string':
+                field_mapping[field_id] = document.get('id')
+            # Receipt specific fields
+            elif field_name == 'Vendor' and data_type == 'string':
+                field_mapping[field_id] = document.get('vendor')
+            elif field_name == 'Invoice Number' and data_type == 'string':
+                field_mapping[field_id] = document.get('invoiceNumber')
+            elif field_name == 'Tax' and data_type == 'monetary':
+                field_mapping[field_id] = document.get('tax')
+            elif field_name == 'Total' and data_type == 'monetary':
+                field_mapping[field_id] = document.get('total')
+            elif field_name == 'Currency' and data_type == 'string':
+                field_mapping[field_id] = document.get('currency')
+            elif field_name == 'Payment Type' and data_type == 'select':
+                value = document.get('paymentType', {}).get('type')
+                field_options = extra_data.get('select_options', [])
+                if value and value.lower() in field_options:
+                    index = field_options.index(value.lower())
+                    field_mapping[field_id] = index
+            elif field_name == 'Card Last Four Digits' and data_type == 'string':
+                field_mapping[field_id] = document.get('paymentType.cardLastFourDigits')
+            # Business Card specific fields
+            elif field_name == 'First Name' and data_type == 'string':
+                field_mapping[field_id] = document.get('firstName')
+            elif field_name == 'Surname' and data_type == 'string':
+                field_mapping[field_id] = document.get('surname')
+            elif field_name == 'Company' and data_type == 'string':
+                field_mapping[field_id] = document.get('company')
+            elif field_name == 'Email' and data_type == 'string':
+                field_mapping[field_id] = document.get('email')
+            elif field_name == 'Phone' and data_type == 'string':
+                field_mapping[field_id] = document.get('phone')
+            elif field_name == 'City' and data_type == 'string':
+                field_mapping[field_id] = document.get('city')
+            elif field_name == 'State' and data_type == 'string':
+                field_mapping[field_id] = document.get('state')
+            elif field_name == 'Zip' and data_type == 'string':
+                field_mapping[field_id] = document.get('zip')
+            elif field_name == 'Website' and data_type == 'url':
+                field_mapping[field_id] = document.get('website')
+
+        return field_mapping
 
     def get_document_type_name(self, document):
         """Determine the document type name based on Shoeboxed document type"""
@@ -530,6 +768,8 @@ class DocumentProcessor:
         else:
             correspondent_name = None
 
+        if correspondent_name:
+            correspondent_name = correspondent_name.strip()
         return correspondent_name
 
     def get_tags(self, document):
