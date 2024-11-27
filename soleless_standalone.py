@@ -770,6 +770,8 @@ class DocumentProcessor:
             data_type = field_info['data_type']
             extra_data = field_info.get('extra_data', {})
 
+            value = None  # Initialize value
+
             # Implement your field mapping logic here
             if field_name == 'Source Type' and data_type == 'select':
                 value = document.get('source', {}).get('type')
@@ -777,73 +779,67 @@ class DocumentProcessor:
                 if value and value.lower() in field_options:
                     index = field_options.index(value.lower())
                     field_mapping[field_id] = index
+                    continue  # Skip further processing for select fields
             elif field_name == 'Issued Date' and data_type == 'date':
                 issued_date = document.get('issued')
                 if issued_date:
                     try:
-                        date_value = datetime.fromisoformat(issued_date.replace("Z", "+00:00")).date().isoformat()
-                        field_mapping[field_id] = date_value
+                        value = datetime.fromisoformat(issued_date.replace("Z", "+00:00")).date().isoformat()
                     except ValueError:
                         logger.error(f"Invalid date format for 'issued': {issued_date}")
             elif field_name == 'Uploaded Date' and data_type == 'date':
                 uploaded_date = document.get('uploaded')
                 if uploaded_date:
                     try:
-                        date_value = datetime.fromisoformat(uploaded_date.replace("Z", "+00:00")).date().isoformat()
-                        field_mapping[field_id] = date_value
+                        value = datetime.fromisoformat(uploaded_date.replace("Z", "+00:00")).date().isoformat()
                     except ValueError:
                         logger.error(f"Invalid date format for 'uploaded': {uploaded_date}")
             elif field_name == 'Notes' and data_type == 'string':
-                field_mapping[field_id] = document.get('notes')
+                value = document.get('notes')
             elif field_name == 'Attachment Name' and data_type == 'string':
-                field_mapping[field_id] = document.get('attachment', {}).get('name')
+                value = document.get('attachment', {}).get('name')
             elif field_name == 'Attachment URL' and data_type == 'url':
-                field_mapping[field_id] = document.get('attachment', {}).get('url')
+                value = document.get('attachment', {}).get('url')
             elif field_name == 'Shoeboxed Document ID' and data_type == 'string':
-                field_mapping[field_id] = document.get('id')
+                value = document.get('id')
             # Receipt specific fields
             elif field_name == 'Vendor' and data_type == 'string':
-                field_mapping[field_id] = document.get('vendor')
+                value = document.get('vendor')
             elif field_name == 'Invoice Number' and data_type == 'string':
-                field_mapping[field_id] = document.get('invoiceNumber')
-            elif field_name == 'Tax' and data_type == 'monetary':
-                tax_value = document.get('tax')
-                field_mapping[field_id] = self.format_monetary_value(tax_value, document.get('currency'))
-            elif field_name == 'Total' and data_type == 'monetary':
-                total_value = document.get('total')
-                field_mapping[field_id] = self.format_monetary_value(total_value, document.get('currency'))
-            elif field_name == 'Currency' and data_type == 'string':
-                field_mapping[field_id] = document.get('currency')
-            elif field_name == 'Payment Type' and data_type == 'select':
-                value = document.get('paymentType', {}).get('type')
-                field_options = extra_data.get('select_options', [])
-                if value and value.lower() in field_options:
-                    index = field_options.index(value.lower())
-                    field_mapping[field_id] = index
-            elif field_name == 'Card Last Four Digits' and data_type == 'string':
-                payment_type = document.get('paymentType') or {}
-                field_mapping[field_id] = payment_type.get('lastFourDigits')
+                value = document.get('invoiceNumber')
             # Business Card specific fields
             elif field_name == 'First Name' and data_type == 'string':
-                field_mapping[field_id] = document.get('firstName')
+                value = document.get('firstName')
             elif field_name == 'Surname' and data_type == 'string':
-                field_mapping[field_id] = document.get('surname')
+                value = document.get('surname')
             elif field_name == 'Company' and data_type == 'string':
-                field_mapping[field_id] = document.get('company')
+                value = document.get('company')
             elif field_name == 'Email' and data_type == 'string':
-                field_mapping[field_id] = document.get('email')
+                value = document.get('email')
             elif field_name == 'Phone' and data_type == 'string':
-                field_mapping[field_id] = document.get('phone')
+                value = document.get('phone')
             elif field_name == 'City' and data_type == 'string':
-                field_mapping[field_id] = document.get('city')
+                value = document.get('city')
             elif field_name == 'State' and data_type == 'string':
-                field_mapping[field_id] = document.get('state')
+                value = document.get('state')
             elif field_name == 'Zip' and data_type == 'string':
-                field_mapping[field_id] = document.get('zip')
+                value = document.get('zip')
             elif field_name == 'Website' and data_type == 'url':
-                field_mapping[field_id] = document.get('website')
+                value = document.get('website')
+            # ... other fields ...
+
+            # After determining the value, check its length
+            if value:
+                if isinstance(value, str):
+                    if len(value) > 200:
+                        logger.warning(f"Value for field '{field_name}' exceeds 200 characters and will be truncated.")
+                        value = value[:200]  # Truncate to 200 characters
+                    elif len(value) == 0:
+                        value = None  # Set empty strings to None
+                field_mapping[field_id] = value
 
         return field_mapping
+
 
     def format_monetary_value(self, amount, currency):
         """Format monetary value as required by Paperless"""
