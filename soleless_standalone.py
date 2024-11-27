@@ -19,6 +19,7 @@ RETRY_DELAY = int(os.getenv('RETRY_DELAY', 5))  # seconds
 TOKEN_REFRESH_MARGIN = timedelta(minutes=5)  # Refresh 5 minutes before expiration
 TASK_POLL_INTERVAL = int(os.getenv('TASK_POLL_INTERVAL', 10))  # seconds
 TASK_TIMEOUT = int(os.getenv('TASK_TIMEOUT', 600))  # seconds
+BATCH_SIZE = int(os.getenv('BATCH_SIZE', 100))
 
 # ===========================
 # Utility Functions
@@ -39,6 +40,11 @@ def retry_operation(operation, *args, max_retries=MAX_RETRIES, retry_delay=RETRY
             else:
                 logger.error(f"Operation failed after {max_retries} attempts.")
                 raise
+
+def chunk_list(lst, chunk_size):
+    """Yield successive chunk_size-sized chunks from lst."""
+    for i in range(0, len(lst), chunk_size):
+        yield lst[i:i + chunk_size]
 
 # ===========================
 # Shoeboxed Client Class
@@ -389,7 +395,7 @@ class PaperlessClient:
                 logger.error(f"Failed to fetch correspondents. Status Code: {response.status_code}, Response: {response.text}")
                 break
         return existing_correspondent_names
-    
+
     def create_correspondent(self, name):
         """Create a new correspondent and return its ID"""
         payload = {"name": name}
@@ -618,7 +624,7 @@ class PaperlessClient:
                 logger.error(f"Failed to fetch tasks. Status Code: {response.status_code}, Response: {response.text}")
                 break
         return failed_tasks
-    
+
     def check_task_status(self, task_id):
         """Check the status of a task without blocking."""
         task_url = f"{self.url}/api/tasks/?task_id={task_id}"
@@ -654,7 +660,7 @@ class PaperlessClient:
             logger.error(f"Failed to get task status for {task_id}. Status Code: {response.status_code}, Response: {response.text}")
             return None, None
 
-    
+
 # ===========================
 # Document Processor Class
 # ===========================
@@ -838,7 +844,7 @@ class DocumentProcessor:
                 field_mapping[field_id] = document.get('website')
 
         return field_mapping
-    
+
     def format_monetary_value(self, amount, currency):
         """Format monetary value as required by Paperless"""
         if amount is None:
@@ -892,7 +898,7 @@ class DocumentProcessor:
             if envelope_id:
                 tags.add(envelope_id.upper())
 
-        return tags    
+        return tags
 
 # ===========================
 # Task Monitor Class
@@ -1018,34 +1024,40 @@ def main():
             logger.error(f"Failed to fetch documents for account {account_id}: {e}")
             continue
 
-    # Pre-process metadata to avoid race conditions
-    document_processor.pre_process_metadata(all_documents)
+    # Split documents into batches
+    batches = list(chunk_list(all_documents, BATCH_SIZE))
 
-    # Process documents concurrently
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(document_processor.process_document, document) for document in all_documents]
+    total_batches = len(batches)
+    for batch_index, batch in enumerate(batches, start=1):
+        logger.info(f"Processing batch {batch_index} of {total_batches} with {len(batch)} documents.")
 
-        # Wait for all document processing tasks to complete
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                result = future.result()
-                if result:
-                    logger.info("Document processed successfully.")
-                else:
-                    logger.error("Document failed to process.")
-            except Exception as exc:
-                logger.error(f"Document processing generated an exception: {exc}")
+        # Pre-process metadata for the current batch
+        document_processor.pre_process_metadata(batch)
 
-    # Wait for all tasks in the queue to be processed
-    while not task_queue.empty() or task_monitor.pending_tasks:
-        logger.info("Waiting for all tasks to complete...")
-        time.sleep(TASK_POLL_INTERVAL)
+        # Process documents in the batch concurrently
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [executor.submit(document_processor.process_document, document) for document in batch]
 
-    # Stop the task monitor
+            # Wait for all document processing tasks in the batch to complete
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result()
+                    if result:
+                        logger.info("Document processed successfully.")
+                    else:
+                        logger.error("Document failed to process.")
+                except Exception as exc:
+                    logger.error(f"Document processing generated an exception: {exc}")
+
+        # Wait for all tasks in the queue to be processed before moving to the next batch
+        while not task_queue.empty() or task_monitor.pending_tasks:
+            logger.info(f"Waiting for all tasks in batch {batch_index} to complete...")
+            time.sleep(TASK_POLL_INTERVAL)
+
+        logger.info(f"Batch {batch_index} processing completed.")
+
+    # Stop the task monitor after all batches are processed
     task_monitor.stop()
     task_monitor.join()
 
     logger.info("Document migration completed successfully.")
-
-if __name__ == "__main__":
-    main()
