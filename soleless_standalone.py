@@ -266,7 +266,6 @@ class PaperlessClient:
             {"name": "Uploaded Date", "data_type": "date", "extra_data": "null"},
             {"name": "Notes", "data_type": "string", "extra_data": "null"},
             {"name": "Attachment Name", "data_type": "string", "extra_data": "null"},
-            {"name": "Attachment URL", "data_type": "url", "extra_data": "null"},
             {"name": "Shoeboxed Document ID", "data_type": "string", "extra_data": "null"},
             # Receipt fields
             {"name": "Invoice Number", "data_type": "string", "extra_data": "null"},
@@ -798,8 +797,6 @@ class DocumentProcessor:
                 value = document.get('notes')
             elif field_name == 'Attachment Name' and data_type == 'string':
                 value = document.get('attachment', {}).get('name')
-            elif field_name == 'Attachment URL' and data_type == 'url':
-                value = document.get('attachment', {}).get('url')
             elif field_name == 'Shoeboxed Document ID' and data_type == 'string':
                 value = document.get('id')
             # Receipt specific fields
