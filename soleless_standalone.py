@@ -794,7 +794,7 @@ class DocumentProcessor:
                     except ValueError:
                         logger.error(f"Invalid date format for 'uploaded': {uploaded_date}")
             elif field_name == 'Notes' and data_type == 'string':
-                value = document.get('notes')
+                value = document.get('notes')  # No truncation for Notes
             elif field_name == 'Attachment Name' and data_type == 'string':
                 value = document.get('attachment', {}).get('name')
             elif field_name == 'Shoeboxed Document ID' and data_type == 'string':
@@ -804,6 +804,24 @@ class DocumentProcessor:
                 value = document.get('vendor')
             elif field_name == 'Invoice Number' and data_type == 'string':
                 value = document.get('invoiceNumber')
+            elif field_name == 'Tax' and data_type == 'monetary':
+                tax_value = document.get('tax')
+                value = self.format_monetary_value(tax_value, document.get('currency'))
+            elif field_name == 'Total' and data_type == 'monetary':
+                total_value = document.get('total')
+                value = self.format_monetary_value(total_value, document.get('currency'))
+            elif field_name == 'Currency' and data_type == 'string':
+                value = document.get('currency')
+            elif field_name == 'Payment Type' and data_type == 'select':
+                value = document.get('paymentType', {}).get('type')
+                field_options = extra_data.get('select_options', [])
+                if value and value.lower() in field_options:
+                    index = field_options.index(value.lower())
+                    field_mapping[field_id] = index
+                    continue
+            elif field_name == 'Card Last Four Digits' and data_type == 'string':
+                payment_type = document.get('paymentType') or {}
+                value = payment_type.get('lastFourDigits')
             # Business Card specific fields
             elif field_name == 'First Name' and data_type == 'string':
                 value = document.get('firstName')
@@ -823,11 +841,10 @@ class DocumentProcessor:
                 value = document.get('zip')
             elif field_name == 'Website' and data_type == 'url':
                 value = document.get('website')
-            # ... other fields ...
 
-            # After determining the value, check its length
+            # Handle string length limits, except for Notes
             if value:
-                if isinstance(value, str):
+                if field_name != 'Notes' and isinstance(value, str):
                     if len(value) > 200:
                         logger.warning(f"Value for field '{field_name}' exceeds 200 characters and will be truncated.")
                         value = value[:200]  # Truncate to 200 characters
@@ -836,7 +853,6 @@ class DocumentProcessor:
                 field_mapping[field_id] = value
 
         return field_mapping
-
 
     def format_monetary_value(self, amount, currency):
         """Format monetary value as required by Paperless"""
