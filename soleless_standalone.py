@@ -1024,15 +1024,15 @@ def main():
             logger.error(f"Failed to fetch documents for account {account_id}: {e}")
             continue
 
+    # Pre-process metadata for all documents before batch processing
+    document_processor.pre_process_metadata(all_documents)
+
     # Split documents into batches
     batches = list(chunk_list(all_documents, BATCH_SIZE))
 
     total_batches = len(batches)
     for batch_index, batch in enumerate(batches, start=1):
         logger.info(f"Processing batch {batch_index} of {total_batches} with {len(batch)} documents.")
-
-        # Pre-process metadata for the current batch
-        document_processor.pre_process_metadata(batch)
 
         # Process documents in the batch concurrently
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
