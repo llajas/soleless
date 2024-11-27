@@ -134,29 +134,41 @@ class ShoeboxedClient:
                 'client_secret': self.client_secret
             }
 
-            try:
-                response = requests.post(token_url, data=payload, headers=headers)
-                response.raise_for_status()
-                response_data = response.json()
-                self.access_token = response_data.get('access_token')
-                self.refresh_token = response_data.get('refresh_token', self.refresh_token)
-                expires_in = response_data.get('expires_in', 1800)
-                self.token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-                logger.info("Access token refreshed successfully.")
-            except requests.exceptions.HTTPError as e:
-                logger.error(f"Failed to refresh access token: {e}")
-                logger.error(f"Response status code: {response.status_code}")
-                logger.error(f"Response body: {response.text}")
-                raise
-            except Exception as e:
-                logger.error(f"Unexpected error during token refresh: {e}", exc_info=True)
-                raise
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    response = requests.post(token_url, data=payload, headers=headers, timeout=30)
+                    response.raise_for_status()
+                    response_data = response.json()
+                    self.access_token = response_data.get('access_token')
+                    self.refresh_token = response_data.get('refresh_token', self.refresh_token)
+                    expires_in = response_data.get('expires_in', 1800)
+                    self.token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                    logger.info("Access token refreshed successfully.")
+                    return  # Exit after successful refresh
+                except requests.exceptions.Timeout:
+                    logger.error(f"Token refresh request timed out on attempt {attempt}.")
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Failed to refresh access token on attempt {attempt}: {e}")
+                    if response is not None:
+                        logger.error(f"Response status code: {response.status_code}")
+                        logger.error(f"Response body: {response.text}")
+                    else:
+                        logger.error("No response received.")
+                except Exception as e:
+                    logger.error(f"Unexpected error during token refresh on attempt {attempt}: {e}", exc_info=True)
 
+                if attempt < MAX_RETRIES:
+                    logger.info(f"Retrying token refresh in {RETRY_DELAY} seconds...")
+                    time.sleep(RETRY_DELAY)
+                else:
+                    logger.error("Maximum token refresh attempts reached. Aborting.")
+                    raise
 
     def ensure_token_validity(self):
         """Ensure the access token is still valid, refresh if necessary"""
         try:
             with self.token_lock:
+                logger.debug("Entered ensure_token_validity")
                 if not self.access_token or datetime.now(timezone.utc) + TOKEN_REFRESH_MARGIN >= self.token_expiry:
                     logger.info("Access token is expired or about to expire. Refreshing...")
                     self.refresh_access_token()
