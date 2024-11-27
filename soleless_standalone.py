@@ -120,6 +120,7 @@ class ShoeboxedClient:
     def refresh_access_token(self):
         """Refresh the access token using the refresh token"""
         with self.token_lock:
+            logger.info("Starting refresh_access_token")
             token_url = "https://id.shoeboxed.com/oauth/token"
             headers = {
                 'Content-Type': 'application/x-www-form-urlencoded',
