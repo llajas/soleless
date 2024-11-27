@@ -56,7 +56,7 @@ class ShoeboxedClient:
         self.access_token = None
         self.refresh_token = None
         self.token_expiry = None  # datetime object
-        self.token_lock = threading.Lock()  # Lock for thread-safe token refresh
+        self.token_lock = threading.RLock()  # Lock for thread-safe token refresh
         self.api_url = 'https://api.shoeboxed.com/v2'
 
     def check_env_vars(self):
