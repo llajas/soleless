@@ -1061,3 +1061,6 @@ def main():
     task_monitor.join()
 
     logger.info("Document migration completed successfully.")
+
+if __name__ == "__main__":
+    main()
