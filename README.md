@@ -82,3 +82,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
   - [Shoeboxed API Explorer](https://api.shoeboxed.com/v2/explorer/index.html)
 - [Paperless NGX](https://github.com/paperless-ngx/paperless-ngx) for creating an open-source document management solution.
   - [Paperless NGX Documentation](https://docs.paperless-ngx.com/)
+
+## Disclaimer
+This tool is intended for personal use only. By using it, you agree to comply with the terms of service of the API provider. The author assumes no liability for any misuse of this tool.
