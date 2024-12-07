@@ -1,6 +1,6 @@
 # Soleless Standalone
 
-Soleless Standalone is a Python-based script designed for migrating documents from Shoeboxed to Paperless. It connects to the Shoeboxed API to retrieve documents and uploads them to Paperless while also handling document metadata, including custom fields, tags, and correspondents. This script is meant for one-time use but could be containerized and automated for repeated migrations.
+Soleless Standalone is a Python-based script designed for migrating documents from Shoeboxed to Paperless. It connects to the Shoeboxed API to retrieve documents and uploads them to Paperless while also handling document metadata, including custom fields, tags, and correspondents. This script is meant for one-time use as it does not maintain any form of state between runs. An OCI compliant 'Containerfile' is included for building a container image for use in a Docker or Kubernetes environment. An example of how this can deployed via Helm chart in a clustered environment can be found at [this link](https://github.com/llajas/homelab/tree/8ea2660d52f09c9b2ba33708b6e9e85718b91c7d/apps/soleless).
 
 ## Features
 - Fetches documents from Shoeboxed accounts.
@@ -12,6 +12,7 @@ Soleless Standalone is a Python-based script designed for migrating documents fr
 ## Prerequisites
 - Python 3.6+
 - Access to Shoeboxed and Paperless API credentials.
+  - Note that in order to obtain an API key for your Shoeboxed account, you'll need to create a new application in the Shoeboxed Developer Portal. Once you have created an application, you will receive a `client_id`, `client_secret` and `redirect_uri` that you can use to authenticate with the Shoeboxed API. The `redirect_uri` is the URL that the user will be redirected to after they have authorized the application.
 
 ## Setup
 
@@ -24,13 +25,20 @@ To configure Soleless Standalone, set the following environment variables:
   - `SHOEBOXED_REDIRECT_URI`: Redirect URI used for OAuth.
   - `AUTHORIZATION_CODE`: Shoeboxed authorization code obtained through OAuth. This is done as described in the Shoeboxed API documentation:
 
-  - **Step 1: Begin Authorization**: Direct the user to the OAuth 2.0 authorization endpoint:
-    
+  - **Begin Authorization**: Direct the user to the OAuth 2.0 authorization endpoint:
+
     ```
     https://id.shoeboxed.com/oauth/authorize?client_id=<your client id>&response_type=code&scope=all&redirect_uri=<your site>
     ```
   
   Once the app is authorized, you will receive a 'code' in the URL (e.g., `https://api.shoeboxed.com/v2/explorer/o2c.html?code=<VALUE>`). This code should be used as the `AUTHORIZATION_CODE` environment variable. Note that the code expires quickly, so it must be used promptly. After the initial authorization, the app can run perpetually by using the refresh token.
+
+- The app has two modes of ignition with regards to the `AUTHORIZATION_CODE`
+  - If the `AUTHORIZATION_CODE` environment variable is set at start-time, the app will use it to obtain an access token and refresh token.
+  - If the `AUTHORIZATION_CODE` environment variable is not set at start-time, the app will direct the user to the Shoeboxed OAuth 2.0 authorization endpoint URI to obtain the authorization code.
+
+This allows the app to run either in an 'interactive' mode so that there is no need to immediately set the `AUTHORIZATION_CODE` environment variable, or in a 'non-interactive' or 'Kubernetes' mode where the `AUTHORIZATION_CODE` environment variable is pre-set at start time, requiring no user interaction to run, but requires fast action once the code is obtained.
+
 
 - **Paperless**
   - `PAPERLESS_URL`: URL to your Paperless instance.
